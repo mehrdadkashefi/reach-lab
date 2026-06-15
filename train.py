@@ -1,18 +1,3 @@
-"""
-train_reach_muscle.py -- train a controller on an effector + task.
-
-    physics.py     low-level dynamics            effectors.py   PointMass / TwoJointArm / Arm26
-    tasks.py       DelayedReaching               models.py      GRUController / ModularGRU
-
-Each run creates  ./experiments/<timestamp>/  and saves the trained controller, the config,
-and the evaluation plots there. Pass --track to log loss components to Weights & Biases.
-
-Examples:
-    python train_reach_muscle.py
-    python train_reach_muscle.py --effector arm_torque
-    python train_reach_muscle.py --arch modular --track
-"""
-
 import argparse
 import datetime
 import json
@@ -37,7 +22,7 @@ def list_of_int(s):   return [int(x) for x in s.split(',')]
 p = argparse.ArgumentParser()
 # --- main / training ---
 p.add_argument("--effector", choices=["point_mass", "arm_torque", "arm26"], default="arm26")
-p.add_argument("--task", default="delayed_reaching")
+p.add_argument("--task", choices=["delayed_reach", "delayed_reach_posture"], default="delayed_reach")
 p.add_argument("--arch", choices=["gru", "modular"], default="gru")
 p.add_argument("--n-batch", type=int, default=600)
 p.add_argument("--batch-size", type=int, default=1024)
@@ -52,8 +37,16 @@ p.add_argument("--dt", type=float, default=0.01)
 p.add_argument("--vis-delay-ms", type=float, default=70)
 p.add_argument("--pro-delay-ms", type=float, default=25)
 # --- task overrides (kwargs) ---
-p.add_argument("--steps", type=int, default=100)
-p.add_argument("--go-range", type=list_of_int, default=[20, 50])
+p.add_argument("--steps", type=int, default=100, help="delayed_reaching episode length")
+p.add_argument("--go-range", type=list_of_int, default=[20, 50], help="delayed_reaching go window")
+# delayed_reach_posture timing (ms); None -> task defaults
+p.add_argument("--init-range-ms",  type=list_of_int, default=None)
+p.add_argument("--delay-range-ms", type=list_of_int, default=None)
+p.add_argument("--move-ms",        type=int,         default=None)
+p.add_argument("--final-range-ms", type=list_of_int, default=None)
+p.add_argument("--null-value",     type=float,       default=None)
+p.add_argument("--final-input",    choices=["null", "target"], default=None)
+p.add_argument("--prob-no-go",     type=float,       default=None, help="fraction of no-go trials")
 # --- controller config ---
 p.add_argument("--hidden-dim", type=int, default=128, help="baseline gru hidden size")
 # modular overrides: leave as None to use ModularGRU's own defaults
@@ -84,9 +77,25 @@ print(f"saving results to {run_dir}")
 # ----------------------------------------------------------------------------- effector + task
 eff = make_effector(args.effector, dt=args.dt,
                     vis_delay_ms=args.vis_delay_ms, pro_delay_ms=args.pro_delay_ms).to(device)
-task = make_task(args.task, eff, steps=args.steps, go_range=args.go_range)
+
+if args.task == "delayed_reach":
+    rk = {} if args.prob_no_go is None else {'prob_no_go': args.prob_no_go}
+    task = make_task(args.task, eff, steps=args.steps, go_range=args.go_range, **rk)
+elif args.task == "delayed_reach_posture":
+    tk = {}
+    if args.init_range_ms  is not None: tk['init_range_ms']  = tuple(args.init_range_ms)
+    if args.delay_range_ms is not None: tk['delay_range_ms'] = tuple(args.delay_range_ms)
+    if args.move_ms        is not None: tk['move_ms']        = args.move_ms
+    if args.final_range_ms is not None: tk['final_range_ms'] = tuple(args.final_range_ms)
+    if args.null_value     is not None: tk['null_value']     = args.null_value
+    if args.final_input    is not None: tk['final_input']    = args.final_input
+    if args.prob_no_go     is not None: tk['prob_no_go']     = args.prob_no_go
+    task = make_task(args.task, eff, **tk)
+else:
+    raise ValueError(f"Invalid task: {args.task}")
 print(f"effector: {eff.name}  (input_dim={eff.input_dim}, output_dim={eff.output_dim}, "
       f"vis_d={eff.vis_d}, pro_d={eff.pro_d})")
+print(f"task: {task.name}  (episode {task.steps} steps = {task.steps * args.dt:.2f} s)")
 
 # ----------------------------------------------------------------------------- controller
 if args.arch == "gru":
@@ -120,11 +129,19 @@ if args.track:
 
 # fixed eval set (same targets each snapshot)
 torch.manual_seed(123)
-eval_theta0, eval_inp, eval_desired = task.make_batch(256)
-eval_go = eval_inp[:, -1, 2] > 0.5
-eval_go_idx = torch.where(eval_go)[0][:12].tolist()
-show_idx = torch.where(eval_go)[0][:3].tolist() + torch.where(~eval_go)[0][:1].tolist()
-labels = ['go', 'go', 'go', 'no-go']
+eval_theta0, eval_inp, eval_desired, eval_timestamps = task.make_batch(256)
+# "reach" trials = desired start differs from desired end (handles delayed_reaching no-go too)
+eval_go = (eval_desired[:, 0] - eval_desired[:, -1]).norm(dim=1) > 1e-6
+go_all = torch.where(eval_go)[0].tolist()
+hold_all = torch.where(~eval_go)[0].tolist()
+eval_go_idx = go_all[:12]
+show_idx, labels = [], []
+for j in go_all[:3]:
+    show_idx.append(j); labels.append('reach')
+if hold_all:
+    show_idx.append(hold_all[0]); labels.append('hold')
+elif len(go_all) > 3:
+    show_idx.append(go_all[3]); labels.append('reach')
 torch.manual_seed(args.seed)
 
 
@@ -211,7 +228,7 @@ def fig_progress_grid(snapshots, desired, idxs, title):
 # ----------------------------------------------------------------------------- train
 loss_hist, snapshots = [], []
 for i in tqdm(range(args.n_batch)):
-    theta0, inp, desired = task.make_batch(args.batch_size)
+    theta0, inp, desired, _ = task.make_batch(args.batch_size)
     states = eff.rollout(controller, theta0, inp)
     pos_loss = mse(states.pos, desired)
     effort_loss = states.action.pow(2).mean()
@@ -249,17 +266,15 @@ controller.eval()
 with torch.no_grad():
     states = eff.rollout(controller, eval_theta0, eval_inp)
 final_err = (states.pos[:, -1, :] - eval_desired[:, -1, :]).norm(dim=1)
-go_err = 100 * final_err[eval_go].mean().item()
-nogo_err = 100 * final_err[~eval_go].mean().item()
-print(f"mean endpoint error (go trials):  {go_err:.2f} cm")
-print(f"mean endpoint error (no-go hold): {nogo_err:.2f} cm")
+reach_err = 100 * final_err[eval_go].mean().item()
+print(f"mean endpoint error (reach trials): {reach_err:.2f} cm")
+wlog = {"eval/final_reach_error_cm": reach_err}
+if bool((~eval_go).any()):
+    hold_err = 100 * final_err[~eval_go].mean().item()
+    print(f"mean endpoint error (hold trials):  {hold_err:.2f} cm")
+    wlog["eval/final_hold_error_cm"] = hold_err
 if args.track:
-    wandb.log({"eval/final_go_error_cm": go_err, "eval/final_nogo_error_cm": nogo_err})
-
-go_idx = torch.where(eval_go)[0][:3].tolist()
-nogo_idx = torch.where(~eval_go)[0][:1].tolist()
-show_idx = go_idx + nogo_idx
-labels = ['go'] * len(go_idx) + ['no-go'] * len(nogo_idx)
+    wandb.log(wlog)
 
 print("\n--- sample trials ---")
 for idx, lab in zip(show_idx, labels):
