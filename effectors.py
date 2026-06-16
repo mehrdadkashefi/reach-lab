@@ -8,23 +8,30 @@ Three effectors, each with its own parameters and a common interface:
 
 Common interface:
     eff.input_dim / eff.output_dim / eff.input_layout / eff.out_bias   # to build the controller
+    eff.perturbation_dim       -> dimensionality of an external perturbation (xy force / joint torque)
     eff.sample_joint(n)        -> initial configuration (joint angles, or xy for the point mass)
     eff.joint_to_cart(theta)   -> fingertip xy (identity for the point mass)
-    eff.rollout(controller, theta0, inp) -> states  (SimpleNamespace: pos, vel, action, ...)
+    eff.rollout(controller, theta0, inp, perturbation=None) -> states  (SimpleNamespace)
 
 Effector-level parameters (overridable via kwargs from the training script):
-    dt, vis_delay_ms, pro_delay_ms, sho_range/elb_range (arms), pos_range (point mass),
-    muscle_names / n_muscles (arm26), torque_scale / force_scale.
+    dt, vis_delay_ms, pro_delay_ms,
+    sho_range/elb_range (arm sampling range), joint_limits (arm range of motion sent to physics),
+    pos_range (point mass), muscle_names (arm26), torque_scale / force_scale / mass.
 
-The visual (long) and proprioceptive (short) feedback delays are handled inside `rollout`.
+An external perturbation (created by the task) is an xy force for the point mass and a signed
+joint torque for the arms; it is added into the physics each step. None means no perturbation.
 """
 
+import math
 from types import SimpleNamespace
 import torch
 
 from physics import (point_mass_step, arm_step, arm_fingertip,
                      arm26_to, arm26_muscle_step, arm26_muscle_length,
                      muscle_activation_step)
+
+# default arm range of motion (rad): shoulder 0-135 deg, elbow 0-155 deg
+DEFAULT_JOINT_LIMITS = ((0.0, math.radians(135)), (0.0, math.radians(155)))
 
 
 class Effector:
@@ -34,6 +41,7 @@ class Effector:
     output_dim = None
     out_bias = 0.0
     proprio_dim = None
+    perturbation_dim = None
     action_names = []
     state_specs = {}
 
@@ -64,12 +72,13 @@ class Effector:
     def joint_to_cart(self, theta): raise NotImplementedError
     def reset(self, theta0): raise NotImplementedError
     def act_from_output(self, out): raise NotImplementedError
-    def step(self, st, action): raise NotImplementedError
+    def step(self, st, action, pert=None): raise NotImplementedError
     def feedback(self, st): raise NotImplementedError
     def collect(self, st, fb): raise NotImplementedError
 
     # --- generic simulation with delayed visual + proprioceptive feedback ---
-    def rollout(self, controller, theta0, inp):
+    def rollout(self, controller, theta0, inp, perturbation=None):
+        """perturbation: optional (batch, steps, perturbation_dim) external force/torque, or None."""
         b, steps = theta0.shape[0], inp.shape[1]
         dev = theta0.device
         vis_d, pro_d = self.vis_d, self.pro_d
@@ -92,7 +101,8 @@ class Effector:
             pro_p = pro_h[:, s - pro_d, :] if s >= pro_d else fb0['proprio']
 
             out, h = controller(torch.cat([inp_v, ft_v, pro_p], dim=1), h)
-            st = self.step(st, self.act_from_output(out))
+            pert_s = perturbation[:, s, :] if perturbation is not None else None
+            st = self.step(st, self.act_from_output(out), pert_s)
             fb = self.feedback(st)
 
             pro_h[:, s, :] = fb['proprio']
@@ -107,6 +117,7 @@ class PointMass(Effector):
     output_dim = 2
     out_bias = 0.0
     proprio_dim = 4                                   # position(2) + velocity(2)
+    perturbation_dim = 2                              # xy force
 
     def __init__(self, dt=0.01, vis_delay_ms=70, pro_delay_ms=25,
                  pos_range=(-0.5, 0.5), mass=1.0, force_scale=10.0, **kwargs):
@@ -131,9 +142,10 @@ class PointMass(Effector):
     def act_from_output(self, out):
         return self.force_scale * (2.0 * out - 1.0)   # [0,1] -> signed force
 
-    def step(self, st, force):
-        pos, vel = point_mass_step(st['pos'], st['vel'], force, self.dt, self.mass)
-        return {'pos': pos, 'vel': vel, 'force': force}
+    def step(self, st, force, pert=None):
+        applied = force if pert is None else force + pert        # external perturbation force
+        pos, vel = point_mass_step(st['pos'], st['vel'], applied, self.dt, self.mass)
+        return {'pos': pos, 'vel': vel, 'force': force}          # store the control force (for effort)
 
     def feedback(self, st):
         return {'fingertip': st['pos'], 'vel': st['vel'],
@@ -149,13 +161,17 @@ class TwoJointArm(Effector):
     output_dim = 2
     out_bias = 0.0
     proprio_dim = 4                                   # joint angles(2) + joint velocities(2)
+    perturbation_dim = 2                              # joint torque
 
     def __init__(self, dt=0.01, vis_delay_ms=70, pro_delay_ms=25,
-                 sho_range=(0.35, 1.75), elb_range=(0.52, 2.18), torque_scale=10.0, **kwargs):
+                 sho_range=(0.35, 1.75), elb_range=(0.52, 2.18), torque_scale=10.0,
+                 joint_limits=DEFAULT_JOINT_LIMITS, **kwargs):
         super().__init__(dt, vis_delay_ms, pro_delay_ms, **kwargs)
-        self.sho_range = sho_range
+        self.sho_range = sho_range                    # sampling range (where targets are drawn)
         self.elb_range = elb_range
         self.torque_scale = torque_scale
+        (slo, shi), (elo, ehi) = joint_limits         # range of motion -> physics
+        self.lim = (float(slo), float(shi), float(elo), float(ehi))
         self.action_names = ['shoulder torque', 'elbow torque']
         self.state_specs = {'pos': 2, 'vel': 2, 'joints': 2, 'action': 2}
 
@@ -175,9 +191,10 @@ class TwoJointArm(Effector):
     def act_from_output(self, out):
         return self.torque_scale * (2.0 * out - 1.0)  # [0,1] -> signed torque
 
-    def step(self, st, tau):
-        theta, omega = arm_step(st['theta'], st['omega'], tau, self.dt)
-        return {'theta': theta, 'omega': omega, 'tau': tau}
+    def step(self, st, tau, pert=None):
+        applied = tau if pert is None else tau + pert            # external perturbation torque
+        theta, omega = arm_step(st['theta'], st['omega'], applied, self.dt, *self.lim)
+        return {'theta': theta, 'omega': omega, 'tau': tau}      # store the control torque (for effort)
 
     def feedback(self, st):
         ft = arm_fingertip(st['theta'], st['omega'])
@@ -194,12 +211,16 @@ class Arm26(Effector):
     output_dim = 6
     out_bias = -2.0                                   # start with low muscle activity
     proprio_dim = 8                                   # joint angles(2) + muscle lengths(6)
+    perturbation_dim = 2                              # external joint torque
 
     def __init__(self, dt=0.01, vis_delay_ms=70, pro_delay_ms=25,
-                 sho_range=(0.35, 1.75), elb_range=(0.52, 2.18), muscle_names=None, **kwargs):
+                 sho_range=(0.35, 1.75), elb_range=(0.52, 2.18), muscle_names=None,
+                 joint_limits=DEFAULT_JOINT_LIMITS, **kwargs):
         super().__init__(dt, vis_delay_ms, pro_delay_ms, **kwargs)
-        self.sho_range = sho_range
+        self.sho_range = sho_range                    # sampling range (where targets are drawn)
         self.elb_range = elb_range
+        (slo, shi), (elo, ehi) = joint_limits         # range of motion -> physics
+        self.lim = (float(slo), float(shi), float(elo), float(ehi))
         self.muscle_names = muscle_names or ['pectoralis', 'deltoid', 'brachioradialis',
                                              'triceps-lat', 'biceps', 'triceps-long']
         self.n_muscles = len(self.muscle_names)
@@ -228,9 +249,10 @@ class Arm26(Effector):
     def act_from_output(self, out):
         return out                                    # excitation in [0,1]
 
-    def step(self, st, excitation):
+    def step(self, st, excitation, pert=None):
         act = muscle_activation_step(st['act'], excitation, self.dt)
-        theta, omega = arm26_muscle_step(st['theta'], st['omega'], act, self.dt)
+        # external perturbation enters as a joint torque added to the muscle torque
+        theta, omega = arm26_muscle_step(st['theta'], st['omega'], act, self.dt, pert, *self.lim)
         return {'theta': theta, 'omega': omega, 'act': act}
 
     def feedback(self, st):

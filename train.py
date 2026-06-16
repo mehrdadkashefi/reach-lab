@@ -129,7 +129,7 @@ if args.track:
 
 # fixed eval set (same targets each snapshot)
 torch.manual_seed(123)
-eval_theta0, eval_inp, eval_desired, eval_timestamps = task.make_batch(256)
+eval_theta0, eval_inp, eval_desired, eval_perturbation, eval_timestamps = task.make_batch(256)
 # "reach" trials = desired start differs from desired end (handles delayed_reaching no-go too)
 eval_go = (eval_desired[:, 0] - eval_desired[:, -1]).norm(dim=1) > 1e-6
 go_all = torch.where(eval_go)[0].tolist()
@@ -228,8 +228,8 @@ def fig_progress_grid(snapshots, desired, idxs, title):
 # ----------------------------------------------------------------------------- train
 loss_hist, snapshots = [], []
 for i in tqdm(range(args.n_batch)):
-    theta0, inp, desired, _ = task.make_batch(args.batch_size)
-    states = eff.rollout(controller, theta0, inp)
+    theta0, inp, desired, perturbation, _ = task.make_batch(args.batch_size)
+    states = eff.rollout(controller, theta0, inp, perturbation)
     pos_loss = mse(states.pos, desired)
     effort_loss = states.action.pow(2).mean()
     loss = pos_loss + args.effort_w * effort_loss
@@ -245,7 +245,7 @@ for i in tqdm(range(args.n_batch)):
     if (i + 1) % args.snap_every == 0:
         controller.eval()
         with torch.no_grad():
-            ev = eff.rollout(controller, eval_theta0, eval_inp)
+            ev = eff.rollout(controller, eval_theta0, eval_inp, eval_perturbation)
         controller.train()
         err = 100 * (ev.pos[:, -1, :] - eval_desired[:, -1, :]).norm(dim=1)[eval_go].mean().item()
         snapshots.append((i + 1, ev.pos.cpu(), err))
@@ -264,7 +264,7 @@ torch.save(controller.state_dict(), out(f"controller_{args.effector}_{args.arch}
 # ----------------------------------------------------------------------------- evaluate
 controller.eval()
 with torch.no_grad():
-    states = eff.rollout(controller, eval_theta0, eval_inp)
+    states = eff.rollout(controller, eval_theta0, eval_inp, eval_perturbation)
 final_err = (states.pos[:, -1, :] - eval_desired[:, -1, :]).norm(dim=1)
 reach_err = 100 * final_err[eval_go].mean().item()
 print(f"mean endpoint error (reach trials): {reach_err:.2f} cm")

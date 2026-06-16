@@ -19,9 +19,12 @@ def point_mass_step(pos, vel, force, dt: float = 0.01, mass: float = 1.0):
 #   i1=0.051, i2=0.057 (kg.m^2) | joint limits: shoulder [0,135deg], elbow [0,155deg]
 # ----------------------------------------------------------------------------------------
 @torch.jit.script
-def arm_step(theta, omega, tau, dt: float = 0.01):
+def arm_step(theta, omega, tau, dt: float = 0.01,
+             sho_lo: float = 0.0, sho_hi: float = 2.356194490192345,
+             elb_lo: float = 0.0, elb_hi: float = 2.705260340591211):
     """One Euler step of the two-link arm.
     theta, omega, tau: (batch, 2) = [shoulder, elbow] angle / angular-velocity / torque.
+    sho_lo/sho_hi, elb_lo/elb_hi: joint range of motion (rad); defaults are 0-135 / 0-155 deg.
     Returns (theta, omega).
     """
     # segment parameters -> inertia-matrix / Coriolis constants (locals: TorchScript can't
@@ -36,9 +39,6 @@ def arm_step(theta, omega, tau, dt: float = 0.01):
     im11 = 2.0 * m2 * l1 * l2g
     im12 = m2 * l1 * l2g
     cor  = m2 * l1 * l2g
-    pi = 3.141592653589793
-    ub0 = 135.0 * pi / 180.0
-    ub1 = 155.0 * pi / 180.0
 
     elb = theta[:, 1]
     c2 = torch.cos(elb)
@@ -66,9 +66,9 @@ def arm_step(theta, omega, tau, dt: float = 0.01):
     omega = omega + torch.stack([acc0, acc1], dim=1) * dt
     theta = theta + omega * dt    # semi-implicit; MotorNet uses old omega here
 
-    # enforce joint limits (drop these blocks for a free arm)
-    lb = torch.zeros(2, device=theta.device)
-    ub = torch.tensor([ub0, ub1], device=theta.device)
+    # enforce joint limits (range of motion)
+    lb = torch.tensor([sho_lo, elb_lo], device=theta.device)
+    ub = torch.tensor([sho_hi, elb_hi], device=theta.device)
     omega = torch.where(torch.logical_and(omega < 0, theta <= lb), torch.zeros_like(omega), omega)
     omega = torch.where(torch.logical_and(omega > 0, theta >= ub), torch.zeros_like(omega), omega)
     theta = torch.minimum(torch.maximum(theta, lb), ub)
@@ -146,13 +146,20 @@ def arm26_muscle_length(theta):
     return ((a1 + q * a2) * q).sum(1) + _A0.view(1, 6)
 
 
-def arm26_muscle_step(theta, omega, activation, dt: float = 0.01):
+def arm26_muscle_step(theta, omega, activation, dt: float = 0.01, ext_tau=None,
+                      sho_lo: float = 0.0, sho_hi: float = 2.356194490192345,
+                      elb_lo: float = 0.0, elb_hi: float = 2.705260340591211):
     """Advance the arm one step given the current muscle activations.
     activation: (batch, 6) in [0,1] -- the muscle state AFTER activation dynamics.
+    ext_tau:    optional (batch, 2) external joint torque added to the muscle torque
+                (e.g. an experimental perturbation).
+    sho_*/elb_*: joint range of motion (rad), forwarded to arm_step.
     ReLU muscle:  force = activation * Fmax.  For a Hill muscle, replace the `force`
     line with a length/velocity-dependent force using `length` / `velocity` below.
     """
     moment_arm, length, velocity = arm26_moment_arms(theta, omega)
     force = activation.unsqueeze(1) * _FMAX.view(1, 1, 6)         # (batch,1,6)
     tau = -(force * moment_arm).sum(-1)                           # (batch,2) joint torques
-    return arm_step(theta, omega, tau, dt)
+    if ext_tau is not None:
+        tau = tau + ext_tau                                      # add external perturbation torque
+    return arm_step(theta, omega, tau, dt, sho_lo, sho_hi, elb_lo, elb_hi)

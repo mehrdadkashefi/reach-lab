@@ -1,3 +1,19 @@
+"""
+tasks.py -- tasks for the effectors.
+
+Each task owns its parameters (overridable via kwargs) and a make_batch(n) method returning:
+
+    theta0       : (n, dof)              initial configuration, sampled via the effector
+    inp          : (n, steps, 3)         instruction stream  [target_x, target_y, go]
+    desired      : (n, steps, 2)         desired fingertip trajectory
+    perturbation : (n, steps, eff.perturbation_dim) external force/torque, or None for no
+                   perturbation. xy force for the point mass, signed joint torque for the arms.
+                   The effector adds it into the physics each step. To make a perturbing task,
+                   build this tensor (e.g. a signed shoulder/elbow torque per timestep) instead
+                   of returning None.
+    timestamps   : dict of named per-trial epoch boundaries (step indices); for analysis.
+"""
+
 import torch
 
 class DelayedReaching:
@@ -36,7 +52,8 @@ class DelayedReaching:
             'episode_end': torch.full((n,), steps, dtype=torch.long, device=dev),
             'is_no_go':    nogo.squeeze(-1),
         }
-        return theta0, inp, desired, timestamps
+        perturbation = None      # no external perturbation in this task (None == zero)
+        return theta0, inp, desired, perturbation, timestamps
 
 
 class DelayedReachPosture:
@@ -122,7 +139,8 @@ class DelayedReachPosture:
             'episode_end': torch.full((n,), T, dtype=torch.long, device=dev),
             'is_no_go':    nogo.squeeze(-1),
         }
-        return theta0, inp, desired, timestamps
+        perturbation = None      # no external perturbation in this task (None == zero)
+        return theta0, inp, desired, perturbation, timestamps
 
 
 TASKS = {'delayed_reach': DelayedReaching, 'delayed_reach_posture': DelayedReachPosture}
