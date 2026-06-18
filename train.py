@@ -30,6 +30,11 @@ p.add_argument("--n-batch", type=int, default=600)
 p.add_argument("--batch-size", type=int, default=1024)
 p.add_argument("--lr", type=float, default=1e-3)
 p.add_argument("--effort-w", type=float, default=1e-3)
+p.add_argument("--smooth-w", type=float, default=1e-1, help="weight on the control-smoothness penalty")
+p.add_argument("--jerk-w", type=float, default=1e-5,
+               help="weight on the hand-path minimum-jerk penalty")
+p.add_argument("--rate-smooth-w", type=float, default=1e-2,
+               help="weight on RNN hidden-activity temporal smoothness")
 p.add_argument("--snap-every", type=int, default=100)
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--track", action="store_true", help="log metrics to Weights & Biases")
@@ -137,9 +142,22 @@ loss_hist, snapshots = [], []
 for i in tqdm(range(args.n_batch)):
     theta0, inp, desired, perturbation, _ = task.make_batch(args.batch_size)
     states = eff.rollout(controller, theta0, inp, perturbation)
-    pos_loss = mse(states.pos, desired)
+
+    # calculate losses
+    pos_loss    = mse(states.pos, desired)
     effort_loss = states.action.pow(2).mean()
-    loss = pos_loss + args.effort_w * effort_loss
+    smooth_loss = (states.action[:, 1:] - states.action[:, :-1]).pow(2).mean()
+
+    # minimum-jerk
+    jerk = (states.pos[:, 3:] - 3 * states.pos[:, 2:-1]
+            + 3 * states.pos[:, 1:-2] - states.pos[:, :-3]) / (args.dt ** 3)
+    jerk_loss = jerk.pow(2).mean()
+    # hidden-activity smoothness
+    rate_smooth_loss = (states.hidden[:, 1:] - states.hidden[:, :-1]).pow(2).mean()
+
+    loss = (pos_loss + args.effort_w * effort_loss + args.smooth_w * smooth_loss
+            + args.jerk_w * jerk_loss + args.rate_smooth_w * rate_smooth_loss)
+
     opt.zero_grad()
     loss.backward()
     opt.step()
@@ -147,7 +165,8 @@ for i in tqdm(range(args.n_batch)):
 
     if args.track:
         wandb.log({"loss": loss.item(), "pos_loss": pos_loss.item(),
-                   "effort_loss": effort_loss.item()}, step=i)
+                   "effort_loss": effort_loss.item(), "smooth_loss": smooth_loss.item(),
+                   "jerk_loss": jerk_loss.item(), "rate_smooth_loss": rate_smooth_loss.item()}, step=i)
 
     if (i + 1) % args.snap_every == 0:
         controller.eval()

@@ -90,7 +90,7 @@ class Effector:
 
         hist = {k: torch.zeros(b, steps, d, device=dev) for k, d in self.state_specs.items()}
         pro_h = torch.zeros(b, steps, self.proprio_dim, device=dev)
-
+        h_hist = torch.zeros(b, steps, controller.hidden_dim, device=dev)
         for s in range(steps):
             # visual channel (70 ms): instruction + fingertip
             if s >= vis_d:
@@ -101,14 +101,14 @@ class Effector:
             pro_p = pro_h[:, s - pro_d, :] if s >= pro_d else fb0['proprio']
 
             out, h = controller(torch.cat([inp_v, ft_v, pro_p], dim=1), h)
+            h_hist[:, s, :] = h                                              # NEW
             pert_s = perturbation[:, s, :] if perturbation is not None else None
             st = self.step(st, self.act_from_output(out), pert_s)
             fb = self.feedback(st)
-
             pro_h[:, s, :] = fb['proprio']
             for k, v in self.collect(st, fb).items():
                 hist[k][:, s, :] = v
-        return SimpleNamespace(**hist)
+        return SimpleNamespace(hidden=h_hist, **hist) 
 
 
 # ----------------------------------------------------------------------------- point mass
