@@ -58,10 +58,10 @@ class Effector:
     def pro_d(self): return max(1, round(self.pro_delay_ms / 1000 / self.dt))
     @property
     def input_layout(self):
-        # input vector = [ instruction(3) | fingertip(2) | proprio(proprio_dim) ]
-        return [('task', 3), ('vision', 2), ('proprio', self.proprio_dim)]
+        # instruction = [target_x*vis, target_y*vis, target_visible, go]
+        return [('task', 4), ('vision', 2), ('proprio', self.proprio_dim)]
     @property
-    def input_dim(self): return 3 + 2 + self.proprio_dim
+    def input_dim(self): return 4 + 2 + self.proprio_dim
 
     def to(self, device):
         self.device = torch.device(device)
@@ -209,7 +209,7 @@ class TwoJointArm(Effector):
 class Arm26(Effector):
     name = "arm26"
     output_dim = 6
-    out_bias = -2.0                                   # start with low muscle activity
+    out_bias = -5.0                                   # start with low muscle activity
     proprio_dim = 8                                   # joint angles(2) + muscle lengths(6)
     perturbation_dim = 2                              # external joint torque
 

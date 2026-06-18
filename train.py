@@ -46,7 +46,6 @@ p.add_argument("--init-range-ms",  type=list_of_int, default=None)
 p.add_argument("--delay-range-ms", type=list_of_int, default=None)
 p.add_argument("--move-ms",        type=int,         default=None)
 p.add_argument("--final-range-ms", type=list_of_int, default=None)
-p.add_argument("--null-value",     type=float,       default=None)
 p.add_argument("--final-input",    choices=["null", "target"], default=None)
 p.add_argument("--prob-no-go",     type=float,       default=None, help="fraction of no-go trials")
 # --- controller config ---
@@ -89,7 +88,6 @@ elif args.task == "delayed_reach_posture":
     if args.delay_range_ms is not None: tk['delay_range_ms'] = tuple(args.delay_range_ms)
     if args.move_ms        is not None: tk['move_ms']        = args.move_ms
     if args.final_range_ms is not None: tk['final_range_ms'] = tuple(args.final_range_ms)
-    if args.null_value     is not None: tk['null_value']     = args.null_value
     if args.final_input    is not None: tk['final_input']    = args.final_input
     if args.prob_no_go     is not None: tk['prob_no_go']     = args.prob_no_go
     task = make_task(args.task, eff, **tk)

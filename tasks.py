@@ -40,10 +40,12 @@ class DelayedReaching:
         nogo = torch.rand(n, 1, device=dev) < self.prob_no_go
         go_mask = go_mask & ~nogo
 
-        inp = torch.zeros(n, steps, 3, device=dev)
+        inp = torch.zeros(n, steps, 4, device=dev)
         inp[:, :, 0:2] = target.unsqueeze(1)
-        inp[:, :, 2] = go_mask.float()
+        inp[:, :, 2]   = 1.0              # target always visible in this task
+        inp[:, :, 3]   = go_mask.float()
 
+    
         desired = torch.where(go_mask.unsqueeze(-1), target.unsqueeze(1), start.unsqueeze(1))
 
         # per-trial epoch timestamps (step indices); not used in training, handy for analysis
@@ -79,11 +81,10 @@ class DelayedReachPosture:
     """
     name = "delayed_reach_posture"
 
-    def __init__(self, effector, init_range_ms=(300, 500), delay_range_ms=(300, 700),
-                 move_ms=1200, final_range_ms=(300, 500), null_value=-2.0,
+    def __init__(self, effector, init_range_ms=(300, 700), delay_range_ms=(300, 700),
+                 move_ms=1200, final_range_ms=(300, 700),
                  final_input='null', prob_no_go=0.4, **kwargs):
         self.effector = effector
-        self.null_value = null_value
         self.prob_no_go = prob_no_go
         assert final_input in ('null', 'target')
         self.final_input = final_input
@@ -123,9 +124,9 @@ class DelayedReachPosture:
         if self.final_input == 'target':
             show_target = show_target | in_final
 
-        null = torch.full((n, T, 2), self.null_value, device=dev)
-        xy = torch.where(show_target.unsqueeze(-1), target.unsqueeze(1), null)
-        inp = torch.cat([xy, go.unsqueeze(-1)], dim=-1)                    # (n, T, 3)
+        vis = show_target.float().unsqueeze(-1)                # (n, T, 1)
+        xy  = target.unsqueeze(1) * vis                        # zero when target hidden
+        inp = torch.cat([xy, vis, go.unsqueeze(-1)], dim=-1)   # (n, T, 4)
 
         reach = (in_move | in_final) & ~nogo                              # no-go trials hold at start
         desired = torch.where(reach.unsqueeze(-1), target.unsqueeze(1), start.unsqueeze(1))

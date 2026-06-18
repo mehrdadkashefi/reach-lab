@@ -44,7 +44,7 @@ def fig_diagnostics(effector, states, inp, desired, title, num_trial=5):
         ax = axes[3, r]
         for m, mname in enumerate(effector.action_names):
             ax.plot(t_axis, a[:, m], lw=1, label=mname)
-        if effector.name == "arm26": ax.set_ylim(-0.02, 1.0)
+        #if effector.name == "arm26": ax.set_ylim(-0.02, 1.0)
         if r == 0: ax.set_ylabel(f"action a.u."); ax.legend(fontsize=6, ncol=2, loc='upper right')
 
         if r == 3:
