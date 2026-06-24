@@ -37,6 +37,8 @@ p.add_argument("--hold-w", type=float, default=1e-1,
                help="weight on speed during stay times.")
 p.add_argument("--rate-smooth-w", type=float, default=1e-2,
                help="weight on RNN hidden-activity temporal smoothness")
+p.add_argument("--activity-w", type=float, default=1e-2,
+               help="weight on RNN hidden-activity magnitude")
 p.add_argument("--obs-noise", type=float, default=0.0,
                help="std of Gaussian noise on observed body state (vision fingertip + proprio); 0 = off")
 p.add_argument("--neural-noise", type=float, default=0.0,
@@ -162,6 +164,8 @@ for i in tqdm(range(args.n_batch)):
     jerk_loss = jerk.pow(2).mean()
     # hidden-activity smoothness
     rate_smooth_loss = (states.hidden[:, 1:] - states.hidden[:, :-1]).pow(2).mean()
+    # hidden-activity magnitude
+    activity_loss = states.hidden.pow(2).mean()
 
     # Speed penalty before go cue
     T  = desired.shape[1]
@@ -173,7 +177,8 @@ for i in tqdm(range(args.n_batch)):
     
 
     loss = (pos_loss + args.effort_w * effort_loss + args.smooth_w * smooth_loss
-            + args.jerk_w * jerk_loss + args.rate_smooth_w * rate_smooth_loss + args.hold_w * hold_loss)
+            + args.jerk_w * jerk_loss + args.rate_smooth_w * rate_smooth_loss + args.hold_w * hold_loss
+            + args.activity_w * activity_loss)
 
     opt.zero_grad()
     loss.backward()
@@ -184,7 +189,8 @@ for i in tqdm(range(args.n_batch)):
     if args.track:
         contrib = {'loss_tot':loss, 'pos': pos_loss, 'effort': args.effort_w * effort_loss,
            'smooth': args.smooth_w * smooth_loss, 'jerk': args.jerk_w * jerk_loss,
-           'rate_smooth': args.rate_smooth_w * rate_smooth_loss, 'hold': args.hold_w * hold_loss}
+           'rate_smooth': args.rate_smooth_w * rate_smooth_loss, 'hold': args.hold_w * hold_loss,
+           'activity': args.activity_w * activity_loss}
         wandb.log({f'{k}': v.item() for k, v in contrib.items()}, step=i)
 
     if (i + 1) % args.snap_every == 0:
