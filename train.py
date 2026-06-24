@@ -31,8 +31,10 @@ p.add_argument("--batch-size", type=int, default=1024)
 p.add_argument("--lr", type=float, default=1e-3)
 p.add_argument("--effort-w", type=float, default=1e-3)
 p.add_argument("--smooth-w", type=float, default=1e-1, help="weight on the control-smoothness penalty")
-p.add_argument("--jerk-w", type=float, default=1e-5,
+p.add_argument("--jerk-w", type=float, default=1e-8,
                help="weight on the hand-path minimum-jerk penalty")
+p.add_argument("--hold-w", type=float, default=1e-1, 
+               help="weight on speed during stay times.")
 p.add_argument("--rate-smooth-w", type=float, default=1e-2,
                help="weight on RNN hidden-activity temporal smoothness")
 p.add_argument("--snap-every", type=int, default=100)
@@ -126,6 +128,7 @@ controller = controller.to(device)
 
 opt = torch.optim.Adam(controller.parameters(), lr=args.lr)
 mse = nn.MSELoss()
+mae = nn.L1Loss()
 
 if args.track:
     import wandb
@@ -140,11 +143,11 @@ torch.manual_seed(args.seed)
 # ----------------------------------------------------------------------------- train
 loss_hist, snapshots = [], []
 for i in tqdm(range(args.n_batch)):
-    theta0, inp, desired, perturbation, _ = task.make_batch(args.batch_size)
+    theta0, inp, desired, perturbation, ts = task.make_batch(args.batch_size)
     states = eff.rollout(controller, theta0, inp, perturbation)
 
     # calculate losses
-    pos_loss    = mse(states.pos, desired)
+    pos_loss    = mae(states.pos, desired)
     effort_loss = states.action.pow(2).mean()
     smooth_loss = (states.action[:, 1:] - states.action[:, :-1]).pow(2).mean()
 
@@ -155,18 +158,29 @@ for i in tqdm(range(args.n_batch)):
     # hidden-activity smoothness
     rate_smooth_loss = (states.hidden[:, 1:] - states.hidden[:, :-1]).pow(2).mean()
 
+    # Speed penalty before go cue
+    T  = desired.shape[1]
+    tg = torch.arange(T, device=desired.device).unsqueeze(0)         # (1, T)
+    hold = ((tg < ts['move_start'].unsqueeze(1)) |                    # before go
+            (tg >= ts['final_start'].unsqueeze(1))).float()          # after reach
+    hold = torch.maximum(hold, ts['is_no_go'].float().unsqueeze(1))  # all of no-go
+    hold_loss = (states.vel.pow(2).sum(-1) * hold).sum() / hold.sum().clamp(min=1.0)
+    
+
     loss = (pos_loss + args.effort_w * effort_loss + args.smooth_w * smooth_loss
-            + args.jerk_w * jerk_loss + args.rate_smooth_w * rate_smooth_loss)
+            + args.jerk_w * jerk_loss + args.rate_smooth_w * rate_smooth_loss + args.hold_w * hold_loss)
 
     opt.zero_grad()
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(controller.parameters(), max_norm=1.0)
     opt.step()
     loss_hist.append(loss.item())
 
     if args.track:
-        wandb.log({"loss": loss.item(), "pos_loss": pos_loss.item(),
-                   "effort_loss": effort_loss.item(), "smooth_loss": smooth_loss.item(),
-                   "jerk_loss": jerk_loss.item(), "rate_smooth_loss": rate_smooth_loss.item()}, step=i)
+        contrib = {'loss_tot':loss, 'pos': pos_loss, 'effort': args.effort_w * effort_loss,
+           'smooth': args.smooth_w * smooth_loss, 'jerk': args.jerk_w * jerk_loss,
+           'rate_smooth': args.rate_smooth_w * rate_smooth_loss, 'hold': args.hold_w * hold_loss}
+        wandb.log({f'{k}': v.item() for k, v in contrib.items()}, step=i)
 
     if (i + 1) % args.snap_every == 0:
         controller.eval()
