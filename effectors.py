@@ -34,6 +34,33 @@ from physics import (point_mass_step, arm_step, arm_fingertip,
 DEFAULT_JOINT_LIMITS = ((0.0, math.radians(135)), (0.0, math.radians(155)))
 
 
+def ik_2link(xy, l1, l2, elbow_up=True, lim=None):
+    """Closed-form inverse kinematics for the planar 2-link arm (inverse of arm_fingertip).
+
+    Inverts  x = l1 cos(s) + l2 cos(s+e),  y = l1 sin(s) + l2 sin(s+e),
+    where s = shoulder angle, e = elbow angle. xy: (n,2) cartesian fingertip.
+    Returns (theta (n,2), reachable (n,) bool). elbow_up=True picks e>=0 (the branch
+    consistent with a non-negative elbow range of motion). If lim = (sho_lo, sho_hi,
+    elb_lo, elb_hi) is given, theta is clamped into range. Operates on whatever device
+    xy lives on, so effectors can call it directly on GPU/MPS tensors.
+    """
+    xy = torch.as_tensor(xy, dtype=torch.float32)
+    x, y = xy[:, 0], xy[:, 1]
+    r2 = x * x + y * y
+    reachable = (r2 <= (l1 + l2) ** 2 + 1e-9) & (r2 >= (l1 - l2) ** 2 - 1e-9)
+    cos_e = ((r2 - l1 * l1 - l2 * l2) / (2.0 * l1 * l2)).clamp(-1.0, 1.0)
+    e = torch.acos(cos_e)
+    if not elbow_up:
+        e = -e
+    s = torch.atan2(y, x) - torch.atan2(l2 * torch.sin(e), l1 + l2 * torch.cos(e))
+    theta = torch.stack([s, e], dim=1)
+    if lim is not None:
+        slo, shi, elo, ehi = lim
+        theta = torch.stack([theta[:, 0].clamp(slo, shi),
+                             theta[:, 1].clamp(elo, ehi)], dim=1)
+    return theta, reachable
+
+
 class Effector:
     """Base class: holds shared params and the generic delayed-feedback rollout."""
     name = "base"
@@ -70,6 +97,7 @@ class Effector:
     # --- to be provided by subclasses ---
     def sample_joint(self, n): raise NotImplementedError
     def joint_to_cart(self, theta): raise NotImplementedError
+    def cartesian_to_joint(self, xy): raise NotImplementedError
     def reset(self, theta0): raise NotImplementedError
     def act_from_output(self, out): raise NotImplementedError
     def step(self, st, action, pert=None): raise NotImplementedError
@@ -157,6 +185,9 @@ class PointMass(Effector):
     def joint_to_cart(self, theta):
         return theta                                  # the "joint" IS the cartesian position
 
+    def cartesian_to_joint(self, xy):
+        return torch.as_tensor(xy, dtype=torch.float32, device=self.device)  # joint == cartesian
+
     def reset(self, theta0):
         b = theta0.shape[0]
         return {'pos': theta0.clone(), 'vel': torch.zeros(b, 2, device=theta0.device)}
@@ -194,6 +225,7 @@ class TwoJointArm(Effector):
         self.torque_scale = torque_scale
         (slo, shi), (elo, ehi) = joint_limits         # range of motion -> physics
         self.lim = (float(slo), float(shi), float(elo), float(ehi))
+        self.l1, self.l2 = 0.309, 0.333               # link lengths; must match arm_fingertip()
         self.action_names = ['shoulder torque', 'elbow torque']
         self.state_specs = {'pos': 2, 'vel': 2, 'joints': 2, 'action': 2}
 
@@ -204,6 +236,15 @@ class TwoJointArm(Effector):
 
     def joint_to_cart(self, theta):
         return arm_fingertip(theta, torch.zeros_like(theta))[:, :2]
+
+    def cartesian_to_joint(self, xy):
+        xy = torch.as_tensor(xy, dtype=torch.float32, device=self.device)
+        theta, reachable = ik_2link(xy, self.l1, self.l2, lim=self.lim)
+        if not bool(reachable.all()):
+            n_bad = int((~reachable).sum())
+            print(f"    [ik] warning: {n_bad} point(s) outside the arm workspace; "
+                  f"clamped to the nearest reachable joint config.")
+        return theta.to(self.device)
 
     def reset(self, theta0):
         b = theta0.shape[0]
@@ -243,6 +284,7 @@ class Arm26(Effector):
         self.elb_range = elb_range
         (slo, shi), (elo, ehi) = joint_limits         # range of motion -> physics
         self.lim = (float(slo), float(shi), float(elo), float(ehi))
+        self.l1, self.l2 = 0.309, 0.333               # link lengths; must match arm_fingertip()
         self.muscle_names = muscle_names or ['pectoralis', 'deltoid', 'brachioradialis',
                                              'triceps-lat', 'biceps', 'triceps-long']
         self.n_muscles = len(self.muscle_names)
@@ -262,6 +304,15 @@ class Arm26(Effector):
 
     def joint_to_cart(self, theta):
         return arm_fingertip(theta, torch.zeros_like(theta))[:, :2]
+
+    def cartesian_to_joint(self, xy):
+        xy = torch.as_tensor(xy, dtype=torch.float32, device=self.device)
+        theta, reachable = ik_2link(xy, self.l1, self.l2, lim=self.lim)
+        if not bool(reachable.all()):
+            n_bad = int((~reachable).sum())
+            print(f"    [ik] warning: {n_bad} point(s) outside the arm workspace; "
+                  f"clamped to the nearest reachable joint config.")
+        return theta.to(self.device)
 
     def reset(self, theta0):
         b = theta0.shape[0]
