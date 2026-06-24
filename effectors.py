@@ -77,8 +77,19 @@ class Effector:
     def collect(self, st, fb): raise NotImplementedError
 
     # --- generic simulation with delayed visual + proprioceptive feedback ---
-    def rollout(self, controller, theta0, inp, perturbation=None):
-        """perturbation: optional (batch, steps, perturbation_dim) external force/torque, or None."""
+    def rollout(self, controller, theta0, inp, perturbation=None,
+                obs_noise=0.0, neural_noise=0.0):
+        """perturbation: optional (batch, steps, perturbation_dim) external force/torque, or None.
+
+        obs_noise:    std of i.i.d. Gaussian noise added to the *observed* inputs each step:
+                      the instruction / visual target (target xy + visibility & go cues), the
+                      visual fingertip, and the proprioceptive feedback. Noise is in the native
+                      units of each channel and corrupts only what the controller sees, not the
+                      recorded ground-truth trajectory or the underlying instruction tensor.
+        neural_noise: std of i.i.d. Gaussian noise injected into the hidden state each step,
+                      after the controller update. It enters the recurrent dynamics (it
+                      persists to the next step) and is what gets recorded in `hidden`.
+        Both default to 0.0 (deterministic, identical to before)."""
         b, steps = theta0.shape[0], inp.shape[1]
         dev = theta0.device
         vis_d, pro_d = self.vis_d, self.pro_d
@@ -100,8 +111,19 @@ class Effector:
             # proprioceptive channel (25 ms)
             pro_p = pro_h[:, s - pro_d, :] if s >= pro_d else fb0['proprio']
 
+            # sensory observation noise: corrupt only the copy the controller sees.
+            # the instruction (target xy + visibility/go cues) is treated as a visual input
+            # and is noised too, alongside the fingertip and proprioception.
+            if obs_noise > 0.0:
+                inp_v = inp_v + obs_noise * torch.randn_like(inp_v)
+                ft_v = ft_v + obs_noise * torch.randn_like(ft_v)
+                pro_p = pro_p + obs_noise * torch.randn_like(pro_p)
+
             out, h = controller(torch.cat([inp_v, ft_v, pro_p], dim=1), h)
-            h_hist[:, s, :] = h                                              # NEW
+            # neural noise: enters the recurrent state (propagates) and is what we record
+            if neural_noise > 0.0:
+                h = h + neural_noise * torch.randn_like(h)
+            h_hist[:, s, :] = h
             pert_s = perturbation[:, s, :] if perturbation is not None else None
             st = self.step(st, self.act_from_output(out), pert_s)
             fb = self.feedback(st)

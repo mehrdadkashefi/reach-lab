@@ -37,6 +37,10 @@ p.add_argument("--hold-w", type=float, default=1e-1,
                help="weight on speed during stay times.")
 p.add_argument("--rate-smooth-w", type=float, default=1e-2,
                help="weight on RNN hidden-activity temporal smoothness")
+p.add_argument("--obs-noise", type=float, default=0.0,
+               help="std of Gaussian noise on observed body state (vision fingertip + proprio); 0 = off")
+p.add_argument("--neural-noise", type=float, default=0.0,
+               help="std of Gaussian noise injected into the RNN hidden state each step; 0 = off")
 p.add_argument("--snap-every", type=int, default=100)
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--track", action="store_true", help="log metrics to Weights & Biases")
@@ -144,7 +148,8 @@ torch.manual_seed(args.seed)
 loss_hist, snapshots = [], []
 for i in tqdm(range(args.n_batch)):
     theta0, inp, desired, perturbation, ts = task.make_batch(args.batch_size)
-    states = eff.rollout(controller, theta0, inp, perturbation)
+    states = eff.rollout(controller, theta0, inp, perturbation,
+                         obs_noise=args.obs_noise, neural_noise=args.neural_noise)
 
     # calculate losses
     pos_loss    = mae(states.pos, desired)
