@@ -35,13 +35,13 @@ p.add_argument("--n-batch", type=int, default=600)
 p.add_argument("--batch-size", type=int, default=512)
 p.add_argument("--lr", type=float, default=1e-3)
 # Loss weights
-p.add_argument("--w_loss_pos", type=float, default=1)
-p.add_argument("--w_loss_jerk", type=float, default=1e4)
-p.add_argument("--w_loss_action", type=float, default=0.5)
-p.add_argument("--w_loss_action_diff", type=float, default=3e-3)
-p.add_argument("--w_loss_hidden", type=float, default=3e-4)
-p.add_argument("--w_loss_hidden_diff", type=float, default=3e-2)
-# noise in training
+p.add_argument("--w-loss-pos", type=float, default=1)
+p.add_argument("--w-loss-jerk", type=float, default=1e4)
+p.add_argument("--w-loss-action", type=float, default=0.5)
+p.add_argument("--w-loss-action-diff", type=float, default=3e-3)
+p.add_argument("--w-loss-hidden", type=float, default=3e-4)
+p.add_argument("--w-loss-hidden-diff", type=float, default=3e-2)
+# noise in traininz
 p.add_argument("--obs-noise", type=float, default=0.1,
                help="std of Gaussian noise on observed body state (vision fingertip + proprio); 0 = off")
 p.add_argument("--neural-noise", type=float, default=0.05,
