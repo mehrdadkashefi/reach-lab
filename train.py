@@ -26,31 +26,30 @@ p = argparse.ArgumentParser()
 p.add_argument("--effector", choices=["point_mass", "arm_torque", "arm26"], default="arm26")
 p.add_argument("--task", choices=["delayed_reach", "delayed_reach_posture"], default="delayed_reach")
 p.add_argument("--arch", choices=["gru", "modular"], default="gru")
+# --- effector overrides (kwargs) ---
+p.add_argument("--dt", type=float, default=0.01)
+p.add_argument("--vis-delay-ms", type=float, default=70)
+p.add_argument("--pro-delay-ms", type=float, default=25)
+# learning parameters
 p.add_argument("--n-batch", type=int, default=600)
-p.add_argument("--batch-size", type=int, default=1024)
+p.add_argument("--batch-size", type=int, default=512)
 p.add_argument("--lr", type=float, default=1e-3)
-p.add_argument("--effort-w", type=float, default=1e-3)
-p.add_argument("--smooth-w", type=float, default=1e-1, help="weight on the control-smoothness penalty")
-p.add_argument("--jerk-w", type=float, default=1e-8,
-               help="weight on the hand-path minimum-jerk penalty")
-p.add_argument("--hold-w", type=float, default=1e-1, 
-               help="weight on speed during stay times.")
-p.add_argument("--rate-smooth-w", type=float, default=1e-2,
-               help="weight on RNN hidden-activity temporal smoothness")
-p.add_argument("--activity-w", type=float, default=1e-2,
-               help="weight on RNN hidden-activity magnitude")
-p.add_argument("--obs-noise", type=float, default=0.0,
+# Loss weights
+p.add_argument("--w_loss_pos", type=float, default=1)
+p.add_argument("--w_loss_jerk", type=float, default=1e4)
+p.add_argument("--w_loss_action", type=float, default=0.5)
+p.add_argument("--w_loss_action_diff", type=float, default=3e-3)
+p.add_argument("--w_loss_hidden", type=float, default=3e-4)
+p.add_argument("--w_loss_hidden_diff", type=float, default=3e-2)
+# noise in training
+p.add_argument("--obs-noise", type=float, default=0.1,
                help="std of Gaussian noise on observed body state (vision fingertip + proprio); 0 = off")
-p.add_argument("--neural-noise", type=float, default=0.0,
+p.add_argument("--neural-noise", type=float, default=0.05,
                help="std of Gaussian noise injected into the RNN hidden state each step; 0 = off")
 p.add_argument("--snap-every", type=int, default=100)
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--track", action="store_true", help="log metrics to Weights & Biases")
 p.add_argument("--wandb-project", default="arm-rnn")
-# --- effector overrides (kwargs) ---
-p.add_argument("--dt", type=float, default=0.01)
-p.add_argument("--vis-delay-ms", type=float, default=70)
-p.add_argument("--pro-delay-ms", type=float, default=25)
 # --- task overrides (kwargs) ---
 p.add_argument("--steps", type=int, default=100, help="delayed_reaching episode length")
 p.add_argument("--go-range", type=list_of_int, default=[20, 50], help="delayed_reaching go window")
@@ -152,33 +151,25 @@ for i in tqdm(range(args.n_batch)):
     theta0, inp, desired, perturbation, ts = task.make_batch(args.batch_size)
     states = eff.rollout(controller, theta0, inp, perturbation,
                          obs_noise=args.obs_noise, neural_noise=args.neural_noise)
-
-    # calculate losses
-    pos_loss    = mae(states.pos, desired)
-    effort_loss = states.action.pow(2).mean()
-    smooth_loss = (states.action[:, 1:] - states.action[:, :-1]).pow(2).mean()
-
-    # minimum-jerk
-    jerk = (states.pos[:, 3:] - 3 * states.pos[:, 2:-1]
-            + 3 * states.pos[:, 1:-2] - states.pos[:, :-3]) / (args.dt ** 3)
-    jerk_loss = jerk.pow(2).mean()
-    # hidden-activity smoothness
-    rate_smooth_loss = (states.hidden[:, 1:] - states.hidden[:, :-1]).pow(2).mean()
-    # hidden-activity magnitude
-    activity_loss = states.hidden.pow(2).mean()
-
-    # Speed penalty before go cue
-    T  = desired.shape[1]
-    tg = torch.arange(T, device=desired.device).unsqueeze(0)         # (1, T)
-    hold = ((tg < ts['move_start'].unsqueeze(1)) |                    # before go
-            (tg >= ts['final_start'].unsqueeze(1))).float()          # after reach
-    hold = torch.maximum(hold, ts['is_no_go'].float().unsqueeze(1))  # all of no-go
-    hold_loss = (states.vel.pow(2).sum(-1) * hold).sum() / hold.sum().clamp(min=1.0)
     
+    # position loss
+    loss_pos = (states.pos - desired).abs().sum(-1).mean()
+    # jerk loss
+    _jerk = (states.pos[:, 3:] - 3 * states.pos[:, 2:-1]
+        + 3 * states.pos[:, 1:-2] - states.pos[:, :-3])
+    loss_jerk = _jerk.pow(2).sum(-1).mean()                                         
+    # action loss
+    _action  = states.action                                                         
+    _action_diff = _action[:, 1:] - _action[:, :-1]
+    loss_action = _action.pow(2).sum(-1).mean() 
+    loss_action_diff =  _action_diff.pow(2).sum(-1).mean()     
+    # hidden acivity loss
+    _hidden  = states.hidden
+    _hidden_diff = _hidden[:, 1:] - _hidden[:, :-1]
+    loss_hidden = _hidden.pow(2).sum(-1).mean() 
+    loss_hidden_diff = _hidden_diff.pow(2).sum(-1).mean()  
 
-    loss = (pos_loss + args.effort_w * effort_loss + args.smooth_w * smooth_loss
-            + args.jerk_w * jerk_loss + args.rate_smooth_w * rate_smooth_loss + args.hold_w * hold_loss
-            + args.activity_w * activity_loss)
+    loss =  args.w_loss_pos * loss_pos + args.w_loss_jerk * loss_jerk + args.w_loss_action * loss_action + args.w_loss_action_diff * loss_action_diff + args.w_loss_hidden * loss_hidden + args.w_loss_hidden_diff * loss_hidden_diff 
 
     opt.zero_grad()
     loss.backward()
@@ -187,10 +178,10 @@ for i in tqdm(range(args.n_batch)):
     loss_hist.append(loss.item())
 
     if args.track:
-        contrib = {'loss_tot':loss, 'pos': pos_loss, 'effort': args.effort_w * effort_loss,
-           'smooth': args.smooth_w * smooth_loss, 'jerk': args.jerk_w * jerk_loss,
-           'rate_smooth': args.rate_smooth_w * rate_smooth_loss, 'hold': args.hold_w * hold_loss,
-           'activity': args.activity_w * activity_loss}
+        contrib = {'loss_tot': loss, 'pos': args.w_loss_pos * loss_pos, 'jerk': args.w_loss_jerk * loss_jerk,
+            'muscle': args.w_loss_action * loss_action, 'muscle_diff': args.w_loss_action_diff * loss_action_diff, 'hidden':args.w_loss_hidden * loss_hidden,
+            'hidden_diff':  args.w_loss_hidden_diff * loss_hidden_diff }
+
         wandb.log({f'{k}': v.item() for k, v in contrib.items()}, step=i)
 
     if (i + 1) % args.snap_every == 0:
