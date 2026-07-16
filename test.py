@@ -208,6 +208,7 @@ def _run_one_spec(folder, name, spec, eff, controller, task, cfg,
         data["perturbation"] = pert.detach().cpu().numpy()
     for k, v in ts.items():
         data[f"ts_{k}"] = v.detach().cpu().numpy()
+    data['module_size'] = cfg['module_size']
     np.savez(os.path.join(out_dir, "states.npz"), **data)
 
     with open(os.path.join(out_dir, "spec_used.json"), "w") as f:
