@@ -25,6 +25,9 @@ p = argparse.ArgumentParser()
 # --- main / training ---
 p.add_argument("--effector", choices=["point_mass", "arm_torque", "arm26"], default="arm26")
 p.add_argument("--task", choices=["delayed_reach", "delayed_reach_posture"], default="delayed_reach")
+p.add_argument("--desired-profile", choices=["step", "min_jerk"], default="step",
+               help="target trajectory the position loss regresses against: 'step' (jump to "
+                    "target at go) or 'min_jerk' (straight-line minimum-jerk reach)")
 p.add_argument("--arch", choices=["gru", "modular"], default="gru")
 # --- effector overrides (kwargs) ---
 p.add_argument("--dt", type=float, default=0.01)
@@ -41,6 +44,11 @@ p.add_argument("--w-loss-action", type=float, default=0.5)
 p.add_argument("--w-loss-action-diff", type=float, default=3e-3)
 p.add_argument("--w-loss-hidden", type=float, default=3e-4)
 p.add_argument("--w-loss-hidden-diff", type=float, default=3e-2)
+# extra emphasis on the hold epochs (before go = start posture, and after movement = final hold)
+p.add_argument("--w-loss-hold-pos", type=float, default=5.0,
+               help="extra position (L1) loss applied only during the start + final hold epochs")
+p.add_argument("--w-loss-hold-vel", type=float, default=1.0,
+               help="velocity (squared) loss applied only during the start + final hold epochs")
 # noise in traininz
 p.add_argument("--obs-noise", type=float, default=0.1,
                help="std of Gaussian noise on observed body state (vision fingertip + proprio); 0 = off")
@@ -63,7 +71,7 @@ p.add_argument("--prob-no-go",     type=float,       default=None, help="fractio
 # --- controller config ---
 p.add_argument("--hidden-dim", type=int, default=128, help="baseline gru hidden size")
 # modular overrides: leave as None to use ModularGRU's own defaults
-p.add_argument("--module-size",  type=list_of_int,   default=None)
+p.add_argument("--module-size",  type=list_of_int,   default=[256,256,32])
 p.add_argument("--vision-mask",  type=list_of_float, default=None)
 p.add_argument("--proprio-mask", type=list_of_float, default=None)
 p.add_argument("--task-mask",    type=list_of_float, default=None)
@@ -92,10 +100,11 @@ eff = make_effector(args.effector, dt=args.dt,
                     vis_delay_ms=args.vis_delay_ms, pro_delay_ms=args.pro_delay_ms).to(device)
 
 if args.task == "delayed_reach":
-    rk = {} if args.prob_no_go is None else {'prob_no_go': args.prob_no_go}
+    rk = {'desired_profile': args.desired_profile}
+    if args.prob_no_go is not None: rk['prob_no_go'] = args.prob_no_go
     task = make_task(args.task, eff, steps=args.steps, go_range=args.go_range, **rk)
 elif args.task == "delayed_reach_posture":
-    tk = {}
+    tk = {'desired_profile': args.desired_profile}
     if args.init_range_ms  is not None: tk['init_range_ms']  = tuple(args.init_range_ms)
     if args.delay_range_ms is not None: tk['delay_range_ms'] = tuple(args.delay_range_ms)
     if args.move_ms        is not None: tk['move_ms']        = args.move_ms
@@ -145,31 +154,65 @@ num_eval = 30
 eval_theta0, eval_inp, eval_desired, eval_perturbation, eval_timestamps = task.make_batch(num_eval)
 torch.manual_seed(args.seed)
 
+
+def hold_mask_from_ts(ts, T, device):
+    """(batch, T) bool mask that is True during the start hold (before go) and the final hold.
+
+    Uses the per-trial epoch boundaries returned by the task. Works for both tasks:
+      - delayed_reach_posture: start hold = t < move_start, final hold = t >= final_start
+      - delayed_reach:         start hold = t < go_start  (no explicit final-hold epoch)
+    """
+    n = ts['episode_end'].shape[0]
+    tg = torch.arange(T, device=device).unsqueeze(0)                    # (1, T)
+    if 'move_start' in ts:                                              # delayed_reach_posture
+        start_hold = tg < ts['move_start'].to(device).unsqueeze(1)
+        end_hold   = tg >= ts['final_start'].to(device).unsqueeze(1)
+    else:                                                               # delayed_reach
+        start_hold = tg < ts['go_start'].to(device).unsqueeze(1)
+        end_hold   = torch.zeros_like(start_hold)
+    return (start_hold | end_hold)                                     # (n, T) bool
+
 # ----------------------------------------------------------------------------- train
 loss_hist, snapshots = [], []
+best_err = float('inf')                                   # lowest eval endpoint error so far
+best_path = out(f"controller_{args.effector}_{args.arch}_best.pt")
 for i in tqdm(range(args.n_batch)):
     theta0, inp, desired, perturbation, ts = task.make_batch(args.batch_size)
     states = eff.rollout(controller, theta0, inp, perturbation,
                          obs_noise=args.obs_noise, neural_noise=args.neural_noise)
-    
+
     # position loss
     loss_pos = (states.pos - desired).abs().sum(-1).mean()
     # jerk loss
     _jerk = (states.pos[:, 3:] - 3 * states.pos[:, 2:-1]
         + 3 * states.pos[:, 1:-2] - states.pos[:, :-3])
-    loss_jerk = _jerk.pow(2).sum(-1).mean()                                         
+    loss_jerk = _jerk.pow(2).sum(-1).mean()
     # action loss
-    _action  = states.action                                                         
+    _action  = states.action
     _action_diff = _action[:, 1:] - _action[:, :-1]
-    loss_action = _action.pow(2).sum(-1).mean() 
-    loss_action_diff =  _action_diff.pow(2).sum(-1).mean()     
+    loss_action = _action.pow(2).sum(-1).mean()
+    loss_action_diff =  _action_diff.pow(2).sum(-1).mean()
     # hidden acivity loss
     _hidden  = states.hidden
     _hidden_diff = _hidden[:, 1:] - _hidden[:, :-1]
-    loss_hidden = _hidden.pow(2).sum(-1).mean() 
-    loss_hidden_diff = _hidden_diff.pow(2).sum(-1).mean()  
+    loss_hidden = _hidden.pow(2).sum(-1).mean()
+    loss_hidden_diff = _hidden_diff.pow(2).sum(-1).mean()
 
-    loss =  args.w_loss_pos * loss_pos + args.w_loss_jerk * loss_jerk + args.w_loss_action * loss_action + args.w_loss_action_diff * loss_action_diff + args.w_loss_hidden * loss_hidden + args.w_loss_hidden_diff * loss_hidden_diff 
+    # --- hold-epoch losses: extra emphasis on holding still at the start posture and at the
+    #     final location. hmask (batch, T) is True only during those two hold epochs; both
+    #     losses are averaged over the held steps so their scale is independent of epoch length.
+    T = states.pos.shape[1]
+    hmask = hold_mask_from_ts(ts, T, states.pos.device).float()             # (n, T)
+    hden  = hmask.sum().clamp(min=1.0)
+    pos_err = (states.pos - desired).abs().sum(-1)                          # (n, T)
+    vel_sq  = states.vel.pow(2).sum(-1)                                     # (n, T)
+    loss_hold_pos = (pos_err * hmask).sum() / hden                         # heavier position at start+end
+    loss_hold_vel = (vel_sq  * hmask).sum() / hden                         # be still at start+end
+
+    loss = (args.w_loss_pos * loss_pos + args.w_loss_jerk * loss_jerk
+            + args.w_loss_action * loss_action + args.w_loss_action_diff * loss_action_diff
+            + args.w_loss_hidden * loss_hidden + args.w_loss_hidden_diff * loss_hidden_diff
+            + args.w_loss_hold_pos * loss_hold_pos + args.w_loss_hold_vel * loss_hold_vel)
 
     opt.zero_grad()
     loss.backward()
@@ -180,7 +223,8 @@ for i in tqdm(range(args.n_batch)):
     if args.track:
         contrib = {'loss_tot': loss, 'pos': args.w_loss_pos * loss_pos, 'jerk': args.w_loss_jerk * loss_jerk,
             'muscle': args.w_loss_action * loss_action, 'muscle_diff': args.w_loss_action_diff * loss_action_diff, 'hidden':args.w_loss_hidden * loss_hidden,
-            'hidden_diff':  args.w_loss_hidden_diff * loss_hidden_diff }
+            'hidden_diff':  args.w_loss_hidden_diff * loss_hidden_diff,
+            'hold_pos': args.w_loss_hold_pos * loss_hold_pos, 'hold_vel': args.w_loss_hold_vel * loss_hold_vel }
 
         wandb.log({f'{k}': v.item() for k, v in contrib.items()}, step=i)
 
@@ -190,16 +234,23 @@ for i in tqdm(range(args.n_batch)):
             ev = eff.rollout(controller, eval_theta0, eval_inp, eval_perturbation)
         controller.train()
         err = 100 * (ev.pos[:, -1, :] - eval_desired[:, -1, :]).norm(dim=1).mean().item()
+        # keep the checkpoint with the lowest eval endpoint error (so late drift can't ship
+        # a worse model than an earlier, better one).
+        if err < best_err:
+            best_err = err
+            torch.save(controller.state_dict(), best_path)
         if args.track:
             # randomly select num_eval_to_plot indices from eval_desiered
             fr = fig_reaches(ev.pos, eval_desired, title=f"reaches @ batch {i+1} (err {err:.1f} cm)")
             fd = fig_diagnostics(eff, ev, eval_inp, eval_desired, title=f"diagnostics @ batch {i+1}",  num_trial=5)
             wandb.log({"eval/endpoint_error_cm": err,
+                       "eval/best_endpoint_error_cm": best_err,
                        "eval/reaches": wandb.Image(fr),
                        "eval/diagnostics": wandb.Image(fd)}, step=i)
             plt.close(fr); plt.close(fd)
 
 print(f"Training complete.  start loss {loss_hist[0]:.5f} -> final loss {loss_hist[-1]:.5f}")
+print(f"best eval endpoint error {best_err:.2f} cm  (saved to {os.path.basename(best_path)})")
 torch.save(controller.state_dict(), out(f"controller_{args.effector}_{args.arch}.pt"))
 
 

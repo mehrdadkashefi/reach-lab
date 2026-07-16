@@ -12,10 +12,31 @@ Each task owns its parameters (overridable via kwargs) and a make_batch(n) metho
                    build this tensor (e.g. a signed shoulder/elbow torque per timestep) instead
                    of returning None.
     timestamps   : dict of named per-trial epoch boundaries (step indices); for analysis.
+
+desired_profile
+---------------
+Both tasks accept a `desired_profile` switch controlling the *shape* of the target trajectory
+the position loss is regressed against during the reach:
+
+    'step'     : desired jumps to the target the instant the go cue fires (the original
+                 behaviour). The path taken to the target is unconstrained.
+    'min_jerk' : desired follows the minimum-jerk straight line from start to target across
+                 the movement window, then holds at the target. This rewards a straight
+                 Cartesian path and a smooth bell-shaped velocity profile.
+
+Only `desired` changes; the instruction stream `inp` (target xy, visibility, go cue) is
+identical for both profiles, so the network's inputs are unchanged.
 """
 
 import numpy as np
 import torch
+
+
+def _min_jerk_s(tau):
+    """Minimum-jerk position interpolant s(tau) in [0,1], tau clamped to [0,1].
+    s = 10 tau^3 - 15 tau^4 + 6 tau^5  (zero vel/acc at both ends)."""
+    tau = tau.clamp(0.0, 1.0)
+    return tau ** 3 * (10.0 - 15.0 * tau + 6.0 * tau ** 2)
 
 
 # ----------------------------------------------------------------------------- spec helpers
@@ -80,11 +101,15 @@ class DelayedReaching:
     """Reach to a target after a go cue; some trials are no-go (hold at start)."""
     name = "delayed_reaching"
 
-    def __init__(self, effector, steps=100, go_range=(20, 50), prob_no_go=0.3, **kwargs):
+    def __init__(self, effector, steps=100, go_range=(20, 50), prob_no_go=0.3,
+                 desired_profile='step', mj_move_steps=30, **kwargs):
         self.effector = effector
         self.steps = steps
         self.go_range = tuple(go_range)
         self.prob_no_go = prob_no_go
+        assert desired_profile in ('step', 'min_jerk')
+        self.desired_profile = desired_profile
+        self.mj_move_steps = int(mj_move_steps)      # min-jerk ramp duration after the go cue
 
     def make_batch(self, n=None, spec=None):
         """Random batch when spec is None (training), or an explicit batch from a spec dict.
@@ -125,7 +150,12 @@ class DelayedReaching:
         inp[:, :, 2]   = 1.0              # target always visible in this task
         inp[:, :, 3]   = go_mask.float()
 
-        desired = torch.where(go_mask.unsqueeze(-1), target.unsqueeze(1), start.unsqueeze(1))
+        if self.desired_profile == 'step':
+            desired = torch.where(go_mask.unsqueeze(-1), target.unsqueeze(1), start.unsqueeze(1))
+        else:  # 'min_jerk': straight-line min-jerk ramp over mj_move_steps after the go cue
+            tau = (tgrid - go_time).float() / max(1, self.mj_move_steps)
+            s = _min_jerk_s(tau) * (~nogo).float()                       # (n, steps); 0 on no-go
+            desired = start.unsqueeze(1) + (target - start).unsqueeze(1) * s.unsqueeze(-1)
 
         # per-trial epoch timestamps (step indices); not used in training, handy for analysis
         timestamps = {
@@ -161,11 +191,13 @@ class DelayedReachPosture:
 
     def __init__(self, effector, init_range_ms=(300, 700), delay_range_ms=(300, 700),
                  move_ms=1200, final_range_ms=(300, 700),
-                 final_input='null', prob_no_go=0.4, **kwargs):
+                 final_input='null', prob_no_go=0.4, desired_profile='step', **kwargs):
         self.effector = effector
         self.prob_no_go = prob_no_go
         assert final_input in ('null', 'target')
         self.final_input = final_input
+        assert desired_profile in ('step', 'min_jerk')
+        self.desired_profile = desired_profile
 
         ms2steps = lambda ms: max(1, round(ms / 1000 / effector.dt))
         self.init_lo,  self.init_hi  = ms2steps(init_range_ms[0]),  ms2steps(init_range_ms[1])
@@ -239,8 +271,14 @@ class DelayedReachPosture:
         xy  = target.unsqueeze(1) * vis                        # zero when target hidden
         inp = torch.cat([xy, vis, go.unsqueeze(-1)], dim=-1)   # (n, T, 4)
 
-        reach = (in_move | in_final) & ~nogo                              # no-go trials hold at start
-        desired = torch.where(reach.unsqueeze(-1), target.unsqueeze(1), start.unsqueeze(1))
+        if self.desired_profile == 'step':
+            reach = (in_move | in_final) & ~nogo                          # no-go trials hold at start
+            desired = torch.where(reach.unsqueeze(-1), target.unsqueeze(1), start.unsqueeze(1))
+        else:  # 'min_jerk': hold at start, min-jerk straight line across the move window, hold target
+            move_dur = (t3 - t2).clamp(min=1)                             # (n, 1) steps
+            tau = (tg - t2).float() / move_dur.float()                    # (n, T): <0 pre, 0..1 move, >1 final
+            s = _min_jerk_s(tau) * (~nogo).float()                        # (n, T); 0 on no-go (hold start)
+            desired = start.unsqueeze(1) + (target - start).unsqueeze(1) * s.unsqueeze(-1)
 
         # per-trial epoch boundaries (step indices); not used in training, handy for analysis
         timestamps = {
