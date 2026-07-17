@@ -60,6 +60,17 @@ p.add_argument("--obs-noise", type=float, default=0.1,
                help="std of Gaussian noise on observed body state (vision fingertip + proprio); 0 = off")
 p.add_argument("--neural-noise", type=float, default=0.05,
                help="std of Gaussian noise injected into the RNN hidden state each step; 0 = off")
+p.add_argument("--action-noise", type=float, default=0.0,
+               help="std of Gaussian noise added to the motor command sent to the plant each "
+                    "step (native action units: force/torque, or muscle excitation for arm26); 0 = off")
+# random training perturbations (applied to the plant, not observed) -> encourage posture / state feedback
+p.add_argument("--perturb-prob", type=float, default=0.0,
+               help="fraction of training trials that get a random force/torque pulse; 0 = off")
+p.add_argument("--perturb-mag", type=float, default=0.0,
+               help="max perturbation magnitude (N for point mass, N.m joint torque for arms); "
+                    "each hit trial samples uniform [0, mag]")
+p.add_argument("--perturb-dur-ms", type=float, default=100,
+               help="duration (ms) of each perturbation pulse")
 p.add_argument("--snap-every", type=int, default=100)
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--track", action="store_true", help="log metrics to Weights & Biases")
@@ -77,7 +88,7 @@ p.add_argument("--prob-no-go",     type=float,       default=None, help="fractio
 # --- controller config ---
 p.add_argument("--hidden-dim", type=int, default=128, help="baseline gru hidden size")
 # modular overrides: leave as None to use ModularGRU's own defaults
-p.add_argument("--module-size",  type=list_of_int,   default=None)
+p.add_argument("--module-size",  type=list_of_int,   default=[256, 256, 32])
 p.add_argument("--vision-mask",  type=list_of_float, default=None)
 p.add_argument("--proprio-mask", type=list_of_float, default=None)
 p.add_argument("--task-mask",    type=list_of_float, default=None)
@@ -105,12 +116,14 @@ print(f"saving results to {run_dir}")
 eff = make_effector(args.effector, dt=args.dt,
                     vis_delay_ms=args.vis_delay_ms, pro_delay_ms=args.pro_delay_ms).to(device)
 
+perturb_kw = {'perturb_prob': args.perturb_prob, 'perturb_mag': args.perturb_mag,
+              'perturb_dur_ms': args.perturb_dur_ms}
 if args.task == "delayed_reach":
-    rk = {'desired_profile': args.desired_profile}
+    rk = {'desired_profile': args.desired_profile, **perturb_kw}
     if args.prob_no_go is not None: rk['prob_no_go'] = args.prob_no_go
     task = make_task(args.task, eff, steps=args.steps, go_range=args.go_range, **rk)
 elif args.task == "delayed_reach_posture":
-    tk = {'desired_profile': args.desired_profile}
+    tk = {'desired_profile': args.desired_profile, **perturb_kw}
     if args.init_range_ms  is not None: tk['init_range_ms']  = tuple(args.init_range_ms)
     if args.delay_range_ms is not None: tk['delay_range_ms'] = tuple(args.delay_range_ms)
     if args.move_ms        is not None: tk['move_ms']        = args.move_ms
@@ -154,10 +167,12 @@ if args.track:
     import wandb
     wandb.init(project=args.wandb_project, name=os.path.basename(run_dir), config=vars(args))
 
-# fixed eval set (same targets each snapshot)
+# fixed eval set (same targets each snapshot); keep it perturbation-free for clean reach plots
 torch.manual_seed(123)
 num_eval = 30
+_pp = task.perturb_prob; task.perturb_prob = 0.0
 eval_theta0, eval_inp, eval_desired, eval_perturbation, eval_timestamps = task.make_batch(num_eval)
+task.perturb_prob = _pp
 torch.manual_seed(args.seed)
 
 
@@ -185,7 +200,8 @@ best_path = out(f"controller_{args.effector}_{args.arch}_best.pt")
 for i in tqdm(range(args.n_batch)):
     theta0, inp, desired, perturbation, ts = task.make_batch(args.batch_size)
     states = eff.rollout(controller, theta0, inp, perturbation,
-                         obs_noise=args.obs_noise, neural_noise=args.neural_noise)
+                         obs_noise=args.obs_noise, neural_noise=args.neural_noise,
+                         action_noise=args.action_noise)
 
     # position loss
     loss_pos = (states.pos - desired).abs().sum(-1).mean()

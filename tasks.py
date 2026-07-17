@@ -97,12 +97,39 @@ def _constant_perturbation(eff, pspec, n, T, device):
     pert[:, int(pspec["t_start"]):int(pspec["t_end"]), :] = val.unsqueeze(1)
     return pert
 
+
+def _random_perturbation(eff, n, T, device, prob, mag, dur_steps):
+    """Random training perturbation: brief force/torque pulses applied to the *plant* (never
+    shown to the controller), so the network must infer arm state from proprioception and learn
+    a state-feedback policy rather than pure feedforward control.
+
+    For a random `prob` fraction of trials, a pulse of random direction and random magnitude in
+    [0, mag] is applied over a `dur_steps` window starting at a random onset anywhere in the
+    trial (so it can land during the delay/hold as well as the movement). Units are the native
+    perturbation units of the effector: xy force (N) for the point mass, signed joint torque
+    (N.m) for the arms. Returns (n, T, perturbation_dim), or None when disabled."""
+    if prob <= 0.0 or mag <= 0.0:
+        return None
+    pdim = eff.perturbation_dim
+    d = max(1, int(dur_steps))
+    hit = (torch.rand(n, device=device) < prob).float()                    # (n,) which trials
+    onset = torch.randint(0, max(1, T - d), (n,), device=device)           # random onset step
+    direction = torch.randn(n, pdim, device=device)
+    direction = direction / direction.norm(dim=1, keepdim=True).clamp(min=1e-6)
+    magnitude = torch.rand(n, device=device) * mag                         # small..medium in [0,mag]
+    vec = direction * (magnitude * hit).unsqueeze(1)                        # (n, pdim); 0 on un-hit
+    tg = torch.arange(T, device=device).unsqueeze(0)                       # (1, T)
+    win = ((tg >= onset.unsqueeze(1)) & (tg < (onset + d).unsqueeze(1))).float()   # (n, T)
+    return win.unsqueeze(-1) * vec.unsqueeze(1)                            # (n, T, pdim)
+
+
 class DelayedReaching:
     """Reach to a target after a go cue; some trials are no-go (hold at start)."""
     name = "delayed_reaching"
 
     def __init__(self, effector, steps=100, go_range=(20, 50), prob_no_go=0.3,
-                 desired_profile='step', mj_move_steps=30, **kwargs):
+                 desired_profile='step', mj_move_steps=30,
+                 perturb_prob=0.0, perturb_mag=0.0, perturb_dur_ms=100, **kwargs):
         self.effector = effector
         self.steps = steps
         self.go_range = tuple(go_range)
@@ -110,6 +137,10 @@ class DelayedReaching:
         assert desired_profile in ('step', 'min_jerk')
         self.desired_profile = desired_profile
         self.mj_move_steps = int(mj_move_steps)      # min-jerk ramp duration after the go cue
+        # random training perturbations (applied to the plant, not observed by the controller)
+        self.perturb_prob = float(perturb_prob)
+        self.perturb_mag = float(perturb_mag)
+        self.perturb_dur = max(1, round(perturb_dur_ms / 1000 / effector.dt))
 
     def make_batch(self, n=None, spec=None):
         """Random batch when spec is None (training), or an explicit batch from a spec dict.
@@ -132,7 +163,8 @@ class DelayedReaching:
             target  = eff.joint_to_cart(eff.sample_joint(n))
             go_time = torch.randint(self.go_range[0], self.go_range[1], (n, 1), device=dev)
             nogo    = torch.rand(n, 1, device=dev) < self.prob_no_go
-            perturbation = None
+            perturbation = _random_perturbation(eff, n, steps, dev,
+                                                self.perturb_prob, self.perturb_mag, self.perturb_dur)
         else:
             theta0, target, n = _resolve_start_target(eff, spec, dev)
             steps   = int(spec.get("steps", self.steps))
@@ -191,13 +223,18 @@ class DelayedReachPosture:
 
     def __init__(self, effector, init_range_ms=(300, 700), delay_range_ms=(300, 700),
                  move_ms=1200, final_range_ms=(300, 700),
-                 final_input='null', prob_no_go=0.4, desired_profile='step', **kwargs):
+                 final_input='null', prob_no_go=0.4, desired_profile='step',
+                 perturb_prob=0.0, perturb_mag=0.0, perturb_dur_ms=100, **kwargs):
         self.effector = effector
         self.prob_no_go = prob_no_go
         assert final_input in ('null', 'target')
         self.final_input = final_input
         assert desired_profile in ('step', 'min_jerk')
         self.desired_profile = desired_profile
+        # random training perturbations (applied to the plant, not observed by the controller)
+        self.perturb_prob = float(perturb_prob)
+        self.perturb_mag = float(perturb_mag)
+        self.perturb_dur = max(1, round(perturb_dur_ms / 1000 / effector.dt))
 
         ms2steps = lambda ms: max(1, round(ms / 1000 / effector.dt))
         self.init_lo,  self.init_hi  = ms2steps(init_range_ms[0]),  ms2steps(init_range_ms[1])
@@ -241,7 +278,8 @@ class DelayedReachPosture:
             t3 = t2 + self.move                                             # move -> final
             nogo = torch.rand(n, 1, device=dev) < self.prob_no_go          # (n, 1)
             final_input = self.final_input
-            perturbation = None
+            perturbation = _random_perturbation(eff, n, T, dev,
+                                                self.perturb_prob, self.perturb_mag, self.perturb_dur)
         else:
             theta0, target, n = _resolve_start_target(eff, spec, dev)
             init  = _as_col(spec.get("init_steps",  mid(self.init_lo,  self.init_hi)),  n, dev)

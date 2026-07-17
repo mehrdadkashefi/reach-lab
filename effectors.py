@@ -106,7 +106,7 @@ class Effector:
 
     # --- generic simulation with delayed visual + proprioceptive feedback ---
     def rollout(self, controller, theta0, inp, perturbation=None,
-                obs_noise=0.0, neural_noise=0.0):
+                obs_noise=0.0, neural_noise=0.0, action_noise=0.0):
         """perturbation: optional (batch, steps, perturbation_dim) external force/torque, or None.
 
         obs_noise:    std of i.i.d. Gaussian noise added to the *observed* inputs each step:
@@ -117,7 +117,13 @@ class Effector:
         neural_noise: std of i.i.d. Gaussian noise injected into the hidden state each step,
                       after the controller update. It enters the recurrent dynamics (it
                       persists to the next step) and is what gets recorded in `hidden`.
-        Both default to 0.0 (deterministic, identical to before)."""
+        action_noise: std of i.i.d. Gaussian noise added to the motor command (the action sent
+                      to the plant) each step, in the native action units of the effector
+                      (signed force/torque for the point mass / torque arm; muscle excitation
+                      in [0,1] for arm26, which the activation dynamics then low-pass filter).
+                      It perturbs what actually drives the physics, so the network must correct
+                      for it through feedback -- like motor/execution noise.
+        All default to 0.0 (deterministic, identical to before)."""
         b, steps = theta0.shape[0], inp.shape[1]
         dev = theta0.device
         vis_d, pro_d = self.vis_d, self.pro_d
@@ -153,7 +159,12 @@ class Effector:
                 h = h + neural_noise * torch.randn_like(h)
             h_hist[:, s, :] = h
             pert_s = perturbation[:, s, :] if perturbation is not None else None
-            st = self.step(st, self.act_from_output(out), pert_s)
+            # action (motor/execution) noise: perturb the command that drives the plant, so the
+            # network must correct for it via feedback (like obs/neural noise, but on the output)
+            act = self.act_from_output(out)
+            if action_noise > 0.0:
+                act = act + action_noise * torch.randn_like(act)
+            st = self.step(st, act, pert_s)
             fb = self.feedback(st)
             pro_h[:, s, :] = fb['proprio']
             for k, v in self.collect(st, fb).items():
