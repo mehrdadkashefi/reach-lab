@@ -49,6 +49,12 @@ p.add_argument("--w-loss-hold-pos", type=float, default=5.0,
                help="extra position (L1) loss applied only during the start + final hold epochs")
 p.add_argument("--w-loss-hold-vel", type=float, default=1.0,
                help="velocity (squared) loss applied only during the start + final hold epochs")
+# urgency: push the network to reach fast without shortening the move window
+p.add_argument("--w-loss-urgency", type=float, default=0.0,
+               help="weight on a time-rising penalty of distance-to-final-target after the go "
+                    "cue; encourages a fast, early-peaking reach. 0 = off (default)")
+p.add_argument("--urgency-tau-ms", type=float, default=300.0,
+               help="time constant (ms) of the urgency ramp; smaller = more urgent / faster reach")
 # noise in traininz
 p.add_argument("--obs-noise", type=float, default=0.1,
                help="std of Gaussian noise on observed body state (vision fingertip + proprio); 0 = off")
@@ -71,7 +77,7 @@ p.add_argument("--prob-no-go",     type=float,       default=None, help="fractio
 # --- controller config ---
 p.add_argument("--hidden-dim", type=int, default=128, help="baseline gru hidden size")
 # modular overrides: leave as None to use ModularGRU's own defaults
-p.add_argument("--module-size",  type=list_of_int,   default=[256,256,32])
+p.add_argument("--module-size",  type=list_of_int,   default=None)
 p.add_argument("--vision-mask",  type=list_of_float, default=None)
 p.add_argument("--proprio-mask", type=list_of_float, default=None)
 p.add_argument("--task-mask",    type=list_of_float, default=None)
@@ -209,10 +215,26 @@ for i in tqdm(range(args.n_batch)):
     loss_hold_pos = (pos_err * hmask).sum() / hden                         # heavier position at start+end
     loss_hold_vel = (vel_sq  * hmask).sum() / hden                         # be still at start+end
 
+    # --- urgency: penalize still being far from the FINAL target as time passes after the go
+    #     cue, with an exponentially-rising weight u(t) = 1 - exp(-(t - t_go)/tau). Movement
+    #     time is set by urgency_tau_ms, decoupled from the length of the go/move window, so a
+    #     small tau forces a fast, early-peaking reach even in a long window. off when weight 0.
+    dev = states.pos.device
+    go_step = (ts['move_start'] if 'move_start' in ts else ts['go_start']).to(dev)   # (n,)
+    tgs = torch.arange(T, device=dev).unsqueeze(0)                                    # (1, T)
+    tau_u = max(1.0, args.urgency_tau_ms / 1000.0 / args.dt)                          # steps
+    dgo = (tgs - go_step.unsqueeze(1)).clamp(min=0)                                   # steps since go
+    u = (1.0 - torch.exp(-dgo / tau_u)) * (tgs >= go_step.unsqueeze(1)).float()       # (n, T)
+    u = u * (~ts['is_no_go']).float().unsqueeze(1)                                    # no urgency on no-go
+    final_tgt = desired[:, -1:, :]                                                    # (n, 1, 2)
+    dist_final = (states.pos - final_tgt).abs().sum(-1)                               # (n, T)
+    loss_urgency = (dist_final * u).sum() / u.sum().clamp(min=1.0)
+
     loss = (args.w_loss_pos * loss_pos + args.w_loss_jerk * loss_jerk
             + args.w_loss_action * loss_action + args.w_loss_action_diff * loss_action_diff
             + args.w_loss_hidden * loss_hidden + args.w_loss_hidden_diff * loss_hidden_diff
-            + args.w_loss_hold_pos * loss_hold_pos + args.w_loss_hold_vel * loss_hold_vel)
+            + args.w_loss_hold_pos * loss_hold_pos + args.w_loss_hold_vel * loss_hold_vel
+            + args.w_loss_urgency * loss_urgency)
 
     opt.zero_grad()
     loss.backward()
@@ -224,7 +246,8 @@ for i in tqdm(range(args.n_batch)):
         contrib = {'loss_tot': loss, 'pos': args.w_loss_pos * loss_pos, 'jerk': args.w_loss_jerk * loss_jerk,
             'muscle': args.w_loss_action * loss_action, 'muscle_diff': args.w_loss_action_diff * loss_action_diff, 'hidden':args.w_loss_hidden * loss_hidden,
             'hidden_diff':  args.w_loss_hidden_diff * loss_hidden_diff,
-            'hold_pos': args.w_loss_hold_pos * loss_hold_pos, 'hold_vel': args.w_loss_hold_vel * loss_hold_vel }
+            'hold_pos': args.w_loss_hold_pos * loss_hold_pos, 'hold_vel': args.w_loss_hold_vel * loss_hold_vel,
+            'urgency': args.w_loss_urgency * loss_urgency }
 
         wandb.log({f'{k}': v.item() for k, v in contrib.items()}, step=i)
 
