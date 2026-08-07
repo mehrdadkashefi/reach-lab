@@ -76,6 +76,9 @@ p.add_argument("--seed", type=int, default=0)
 p.add_argument("--track", action="store_true", help="log metrics to Weights & Biases")
 p.add_argument("--wandb-project", default="arm-rnn")
 # --- task overrides (kwargs) ---
+p.add_argument("--go-pulse-ms", type=float, default=150,
+               help="go-cue pulse duration (ms): the go input goes to 1 at go onset and back "
+                    "to 0 after this long; 0 or negative = sustained cue (old step behaviour)")
 p.add_argument("--steps", type=int, default=100, help="delayed_reaching episode length")
 p.add_argument("--go-range", type=list_of_int, default=[20, 50], help="delayed_reaching go window")
 # delayed_reach_posture timing (ms); None -> task defaults
@@ -117,7 +120,7 @@ eff = make_effector(args.effector, dt=args.dt,
                     vis_delay_ms=args.vis_delay_ms, pro_delay_ms=args.pro_delay_ms).to(device)
 
 perturb_kw = {'perturb_prob': args.perturb_prob, 'perturb_mag': args.perturb_mag,
-              'perturb_dur_ms': args.perturb_dur_ms}
+              'perturb_dur_ms': args.perturb_dur_ms, 'go_pulse_ms': args.go_pulse_ms}
 if args.task == "delayed_reach":
     rk = {'desired_profile': args.desired_profile, **perturb_kw}
     if args.prob_no_go is not None: rk['prob_no_go'] = args.prob_no_go

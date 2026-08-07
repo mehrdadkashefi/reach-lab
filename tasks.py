@@ -128,12 +128,16 @@ class DelayedReaching:
     name = "delayed_reaching"
 
     def __init__(self, effector, steps=100, go_range=(20, 50), prob_no_go=0.3,
-                 desired_profile='step', mj_move_steps=30,
+                 desired_profile='step', mj_move_steps=30, go_pulse_ms=150,
                  perturb_prob=0.0, perturb_mag=0.0, perturb_dur_ms=100, **kwargs):
         self.effector = effector
         self.steps = steps
         self.go_range = tuple(go_range)
         self.prob_no_go = prob_no_go
+        # go-cue input shape: a short pulse of go_pulse_ms at go onset (default 150 ms).
+        # None or <= 0 -> sustained cue that stays on after go (the old step behaviour).
+        self.go_pulse = (None if (go_pulse_ms is None or go_pulse_ms <= 0)
+                         else max(1, round(go_pulse_ms / 1000 / effector.dt)))
         assert desired_profile in ('step', 'min_jerk')
         self.desired_profile = desired_profile
         self.mj_move_steps = int(mj_move_steps)      # min-jerk ramp duration after the go cue
@@ -150,6 +154,8 @@ class DelayedReaching:
             start_space  ('joint')   : 'joint' or 'cartesian'
             target_space ('cartesian'): 'cartesian' or 'joint'
             go_time                  : go-cue onset step (default: midpoint of go_range)
+            go_pulse_steps           : go-cue pulse length in steps (default: task's go_pulse_ms;
+                                       0 or negative -> sustained cue)
             no_go        (False)     : hold-at-start trials
             steps                    : episode length (default: self.steps)
             perturbation             : {'value', 't_start', 't_end'} or None
@@ -175,12 +181,19 @@ class DelayedReaching:
 
         start = eff.joint_to_cart(theta0)
         tgrid = torch.arange(steps, device=dev).unsqueeze(0).expand(n, steps)
-        go_mask = (tgrid >= go_time) & ~nogo
+        go_mask = (tgrid >= go_time) & ~nogo          # post-go period; drives `desired` below
+
+        # go-cue *input*: a short pulse at go onset (not the sustained go_mask).
+        pulse = self.go_pulse
+        if spec is not None and spec.get("go_pulse_steps") is not None:
+            p = int(spec["go_pulse_steps"])
+            pulse = p if p > 0 else None
+        go_sig = go_mask if pulse is None else (go_mask & (tgrid < go_time + pulse))
 
         inp = torch.zeros(n, steps, 4, device=dev)
         inp[:, :, 0:2] = target.unsqueeze(1)
         inp[:, :, 2]   = 1.0              # target always visible in this task
-        inp[:, :, 3]   = go_mask.float()
+        inp[:, :, 3]   = go_sig.float()
 
         if self.desired_profile == 'step':
             desired = torch.where(go_mask.unsqueeze(-1), target.unsqueeze(1), start.unsqueeze(1))
@@ -205,7 +218,9 @@ class DelayedReachPosture:
                            go = 0, desired = start.            duration ~ init_range_ms
         2. delay         : target shown, but go = 0; still hold at start.
                                                                duration ~ delay_range_ms
-        3. movement      : target shown, go = 1; reach to it.  duration = move_ms (fixed)
+        3. movement      : target shown; the go cue fires as a short pulse (go_pulse_ms,
+                           default 150 ms) at movement onset, then returns to 0; reach to
+                           the target.                         duration = move_ms (fixed)
         4. final hold    : hold at the target. go = 0, desired = target. The instruction xy
                            is either the null_value (final_input='null', default -- mirrors
                            the initial hold, so the network must hold from memory) or the
@@ -224,9 +239,14 @@ class DelayedReachPosture:
     def __init__(self, effector, init_range_ms=(300, 700), delay_range_ms=(300, 700),
                  move_ms=1200, final_range_ms=(300, 700),
                  final_input='null', prob_no_go=0.4, desired_profile='step',
+                 go_pulse_ms=150,
                  perturb_prob=0.0, perturb_mag=0.0, perturb_dur_ms=100, **kwargs):
         self.effector = effector
         self.prob_no_go = prob_no_go
+        # go-cue input shape: a short pulse of go_pulse_ms at movement onset (default 150 ms).
+        # None or <= 0 -> sustained cue that stays on for the whole move window (old behaviour).
+        self.go_pulse = (None if (go_pulse_ms is None or go_pulse_ms <= 0)
+                         else max(1, round(go_pulse_ms / 1000 / effector.dt)))
         assert final_input in ('null', 'target')
         self.final_input = final_input
         assert desired_profile in ('step', 'min_jerk')
@@ -257,6 +277,8 @@ class DelayedReachPosture:
             init_steps / delay_steps / move_steps / final_steps : segment durations in steps
                                        (defaults: each range's midpoint, move = self.move)
             no_go        (False)     : hold-at-start trials
+            go_pulse_steps           : go-cue pulse length in steps (default: task's go_pulse_ms;
+                                       0 or negative -> sustained cue)
             final_input              : 'null' or 'target' (default: self.final_input)
             perturbation             : {'value', 't_start', 't_end'} or None
         """
@@ -300,7 +322,14 @@ class DelayedReachPosture:
         in_move  = (tg >= t2) & (tg < t3)
         in_final = tg >= t3
 
-        go = in_move.float() * (~nogo).float()                            # no go cue on no-go trials
+        # go-cue *input*: a short pulse at movement onset (clipped to the move window);
+        # sustained over the whole move window when the pulse is disabled.
+        pulse = self.go_pulse
+        if spec is not None and spec.get("go_pulse_steps") is not None:
+            p = int(spec["go_pulse_steps"])
+            pulse = p if p > 0 else None
+        go_win = in_move if pulse is None else (in_move & (tg < t2 + pulse))
+        go = go_win.float() * (~nogo).float()                             # no go cue on no-go trials
         show_target = in_delay | in_move
         if final_input == 'target':
             show_target = show_target | in_final

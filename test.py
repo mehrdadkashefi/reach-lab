@@ -23,6 +23,8 @@ the trained task's parameters. Timing keys are interpreted by whichever task the
       "start":  [s, e],                # (dof,) or (n, dof); a single row broadcasts over targets
       "target": [[x, y], ...],         # (2,) or (n, 2)
       "no_go":  false,                 # bool or length-n list
+      "go_pulse_steps": 15,            # go-cue pulse length in steps (default: the trained
+                                       # task's go_pulse_ms; 0 or negative = sustained cue)
 
       # delayed_reach timing:
       "go_time": 30, "steps": 100,
@@ -75,13 +77,16 @@ def build_controller(cfg, effector):
 def build_task(cfg, effector):
     """Reconstruct the task the model trained on, from a saved config dict (mirrors train.py)."""
     name = cfg["task"]
+    # go-cue pulse the model trained with; configs predating the pulse get 0 = sustained cue
+    go_pulse_ms = cfg.get("go_pulse_ms", 0)
     if name == "delayed_reach":
         kw = dict(steps=cfg.get("steps", 100) or 100,
-                  go_range=cfg.get("go_range", [20, 50]))
+                  go_range=cfg.get("go_range", [20, 50]),
+                  go_pulse_ms=go_pulse_ms)
         if cfg.get("prob_no_go") is not None: kw["prob_no_go"] = cfg["prob_no_go"]
         return make_task(name, effector, **kw)
     elif name == "delayed_reach_posture":
-        kw = {}
+        kw = {"go_pulse_ms": go_pulse_ms}
         if cfg.get("init_range_ms")  is not None: kw["init_range_ms"]  = tuple(cfg["init_range_ms"])
         if cfg.get("delay_range_ms") is not None: kw["delay_range_ms"] = tuple(cfg["delay_range_ms"])
         if cfg.get("move_ms")        is not None: kw["move_ms"]        = cfg["move_ms"]
