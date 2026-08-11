@@ -12,7 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from effectors import make_effector
-from tasks import make_task, TASKS
+from tasks import make_task, TASKS, task_input_channels
 from controllers import GRUController, ModularGRU
 
 from utils import fig_reaches, fig_diagnostics, fig_learning_curve
@@ -24,7 +24,8 @@ def list_of_int(s):   return [int(x) for x in s.split(',')]
 p = argparse.ArgumentParser()
 # --- main / training ---
 p.add_argument("--effector", choices=["point_mass", "arm_torque", "arm26"], default="arm26")
-p.add_argument("--task", choices=["delayed_reach", "delayed_reach_posture", "horizon_sequence"],
+p.add_argument("--task", choices=["delayed_reach", "delayed_reach_posture", "horizon_sequence",
+                                  "hold_posture_pulse", "hold_posture_ramp"],
                default="delayed_reach")
 p.add_argument("--desired-profile", choices=["step", "min_jerk"], default="step",
                help="target trajectory the position loss regresses against: 'step' (jump to "
@@ -77,6 +78,26 @@ p.add_argument("--seed", type=int, default=0)
 p.add_argument("--track", action="store_true", help="log metrics to Weights & Biases")
 p.add_argument("--wandb-project", default="arm-rnn")
 # --- task overrides (kwargs) ---
+p.add_argument("--unified-input", action="store_true",
+               help="emit the 10-wide unified instruction stream (3 target slots + go) for "
+                    "single-target tasks, so one network can train on all tasks with a fixed "
+                    "input_dim. No effect on horizon_sequence (already 10-wide).")
+# hold_posture_pulse / hold_posture_ramp
+p.add_argument("--onset-range-ms", type=list_of_int, default=None,
+               help="hold tasks: random bump onset window (ms), default 500,1000")
+p.add_argument("--force-range-n",  type=list_of_float, default=None,
+               help="hold tasks: bump force magnitude range (N), default 1,5")
+p.add_argument("--dur-range-ms",   type=list_of_int, default=None,
+               help="hold_posture_pulse: force pulse duration range (ms), default 100,200")
+p.add_argument("--ramp-range-ms",  type=list_of_int, default=None,
+               help="hold_posture_ramp: force ramp-up duration range (ms), default 200,600")
+p.add_argument("--hold-after-ramp", action="store_true",
+               help="hold_posture_ramp: sustain max force after the ramp instead of releasing")
+p.add_argument("--center-frac",    type=float, default=None,
+               help="hold tasks: fraction of the joint/pos range to sample the start from "
+                    "(default 0.4 = central 40%%, keeps the arm clear of its limits)")
+p.add_argument("--catch-prob",     type=float, default=None,
+               help="hold tasks: fraction of catch trials with no external bump (default 0.3)")
 p.add_argument("--go-pulse-ms", type=float, default=150,
                help="go-cue pulse duration (ms): the go input goes to 1 at go onset and back "
                     "to 0 after this long; 0 or negative = sustained cue (old step behaviour)")
@@ -128,16 +149,16 @@ print(f"saving results to {run_dir}")
 # ----------------------------------------------------------------------------- effector + task
 eff = make_effector(args.effector, dt=args.dt,
                     vis_delay_ms=args.vis_delay_ms, pro_delay_ms=args.pro_delay_ms,
-                    task_dim=TASKS[args.task].input_channels).to(device)
+                    task_dim=task_input_channels(args.task, args.unified_input)).to(device)
 
 perturb_kw = {'perturb_prob': args.perturb_prob, 'perturb_mag': args.perturb_mag,
               'perturb_dur_ms': args.perturb_dur_ms, 'go_pulse_ms': args.go_pulse_ms}
 if args.task == "delayed_reach":
-    rk = {'desired_profile': args.desired_profile, **perturb_kw}
+    rk = {'desired_profile': args.desired_profile, 'unified_input': args.unified_input, **perturb_kw}
     if args.prob_no_go is not None: rk['prob_no_go'] = args.prob_no_go
     task = make_task(args.task, eff, steps=args.steps, go_range=args.go_range, **rk)
 elif args.task == "delayed_reach_posture":
-    tk = {'desired_profile': args.desired_profile, **perturb_kw}
+    tk = {'desired_profile': args.desired_profile, 'unified_input': args.unified_input, **perturb_kw}
     if args.init_range_ms  is not None: tk['init_range_ms']  = tuple(args.init_range_ms)
     if args.delay_range_ms is not None: tk['delay_range_ms'] = tuple(args.delay_range_ms)
     if args.move_ms        is not None: tk['move_ms']        = args.move_ms
@@ -145,6 +166,18 @@ elif args.task == "delayed_reach_posture":
     if args.final_input    is not None: tk['final_input']    = args.final_input
     if args.prob_no_go     is not None: tk['prob_no_go']     = args.prob_no_go
     task = make_task(args.task, eff, **tk)
+elif args.task in ("hold_posture_pulse", "hold_posture_ramp"):
+    hk = {'unified_input': args.unified_input}
+    if args.onset_range_ms is not None: hk['onset_range_ms'] = tuple(args.onset_range_ms)
+    if args.force_range_n  is not None: hk['force_range_n']  = tuple(args.force_range_n)
+    if args.center_frac    is not None: hk['center_frac']    = args.center_frac
+    if args.catch_prob     is not None: hk['catch_prob']     = args.catch_prob
+    if args.task == "hold_posture_pulse":
+        if args.dur_range_ms is not None: hk['dur_range_ms'] = tuple(args.dur_range_ms)
+    else:
+        if args.ramp_range_ms is not None: hk['ramp_range_ms'] = tuple(args.ramp_range_ms)
+        if args.hold_after_ramp:          hk['hold_after_ramp'] = True
+    task = make_task(args.task, eff, **hk)
 elif args.task == "horizon_sequence":
     sk = {'desired_profile': args.desired_profile, **perturb_kw}
     if args.n_reaches        is not None: sk['n_reaches']        = args.n_reaches
@@ -196,12 +229,19 @@ if args.track:
     import wandb
     wandb.init(project=args.wandb_project, name=os.path.basename(run_dir), config=vars(args))
 
-# fixed eval set (same targets each snapshot); keep it perturbation-free for clean reach plots
+# fixed eval set (same targets each snapshot); temporarily disable trial-level randomness that
+# would blank the signal -- the random plant perturbation on the reach tasks, and the no-bump
+# catch fraction on the hold tasks -- so the eval batch is clean and consistent. Only touches
+# whichever of these the task actually has.
 torch.manual_seed(123)
 num_eval = 30
-_pp = task.perturb_prob; task.perturb_prob = 0.0
+_saved = {}
+for _attr in ('perturb_prob', 'catch_prob'):
+    if hasattr(task, _attr):
+        _saved[_attr] = getattr(task, _attr); setattr(task, _attr, 0.0)
 eval_theta0, eval_inp, eval_desired, eval_perturbation, eval_timestamps = task.make_batch(num_eval)
-task.perturb_prob = _pp
+for _attr, _val in _saved.items():
+    setattr(task, _attr, _val)
 torch.manual_seed(args.seed)
 
 
@@ -214,7 +254,9 @@ def hold_mask_from_ts(ts, T, device):
     """
     n = ts['episode_end'].shape[0]
     tg = torch.arange(T, device=device).unsqueeze(0)                    # (1, T)
-    if 'move_start' in ts:                                              # delayed_reach_posture
+    if 'bump_onset' in ts:                                             # hold_posture_* : hold all episode
+        return torch.ones(n, T, dtype=torch.bool, device=device)
+    if 'move_start' in ts:                                              # delayed_reach_posture / horizon_sequence
         start_hold = tg < ts['move_start'].to(device).unsqueeze(1)
         end_hold   = tg >= ts['final_start'].to(device).unsqueeze(1)
     else:                                                               # delayed_reach
@@ -265,15 +307,20 @@ for i in tqdm(range(args.n_batch)):
     #     time is set by urgency_tau_ms, decoupled from the length of the go/move window, so a
     #     small tau forces a fast, early-peaking reach even in a long window. off when weight 0.
     dev = states.pos.device
-    go_step = (ts['move_start'] if 'move_start' in ts else ts['go_start']).to(dev)   # (n,)
-    tgs = torch.arange(T, device=dev).unsqueeze(0)                                    # (1, T)
-    tau_u = max(1.0, args.urgency_tau_ms / 1000.0 / args.dt)                          # steps
-    dgo = (tgs - go_step.unsqueeze(1)).clamp(min=0)                                   # steps since go
-    u = (1.0 - torch.exp(-dgo / tau_u)) * (tgs >= go_step.unsqueeze(1)).float()       # (n, T)
-    u = u * (~ts['is_no_go']).float().unsqueeze(1)                                    # no urgency on no-go
-    final_tgt = desired[:, -1:, :]                                                    # (n, 1, 2)
-    dist_final = (states.pos - final_tgt).abs().sum(-1)                               # (n, T)
-    loss_urgency = (dist_final * u).sum() / u.sum().clamp(min=1.0)
+    go_key = 'move_start' if 'move_start' in ts else ('go_start' if 'go_start' in ts else None)
+    if go_key is None:                                                                # hold tasks: no go cue
+        loss_urgency = torch.zeros((), device=dev)
+    else:
+        go_step = ts[go_key].to(dev)                                                  # (n,)
+        tgs = torch.arange(T, device=dev).unsqueeze(0)                                # (1, T)
+        tau_u = max(1.0, args.urgency_tau_ms / 1000.0 / args.dt)                      # steps
+        dgo = (tgs - go_step.unsqueeze(1)).clamp(min=0)                               # steps since go
+        u = (1.0 - torch.exp(-dgo / tau_u)) * (tgs >= go_step.unsqueeze(1)).float()   # (n, T)
+        if 'is_no_go' in ts:
+            u = u * (~ts['is_no_go']).float().unsqueeze(1)                            # no urgency on no-go
+        final_tgt = desired[:, -1:, :]                                                # (n, 1, 2)
+        dist_final = (states.pos - final_tgt).abs().sum(-1)                           # (n, T)
+        loss_urgency = (dist_final * u).sum() / u.sum().clamp(min=1.0)
 
     loss = (args.w_loss_pos * loss_pos + args.w_loss_jerk * loss_jerk
             + args.w_loss_action * loss_action + args.w_loss_action_diff * loss_action_diff

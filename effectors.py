@@ -26,7 +26,7 @@ import math
 from types import SimpleNamespace
 import torch
 
-from physics import (point_mass_step, arm_step, arm_fingertip,
+from physics import (point_mass_step, arm_step, arm_fingertip, arm_jacobian_T_force,
                      arm26_to, arm26_muscle_step, arm26_muscle_length,
                      muscle_activation_step)
 
@@ -95,6 +95,18 @@ class Effector:
     def to(self, device):
         self.device = torch.device(device)
         return self
+
+    def cartesian_force_to_perturbation(self, theta0, force_xy):
+        """Convert an (n, 2) external Cartesian fingertip force (N) into this effector's native
+        perturbation units (n, perturbation_dim), evaluated at posture theta0. Base = identity
+        (the point mass IS its fingertip). The arms override with tau = J(theta0)^T @ F."""
+        return force_xy
+
+    def sample_center_joint(self, n, frac=0.4):
+        """Sample n start configs from the central `frac` of the sampling range (keeps the arm
+        clear of its joint limits so an external bump doesn't slam it out of range). Default =
+        sample_joint (subclasses that know their range narrow it around the midpoint)."""
+        return self.sample_joint(n)
 
     # --- to be provided by subclasses ---
     def sample_joint(self, n): raise NotImplementedError
@@ -195,6 +207,11 @@ class PointMass(Effector):
         lo, hi = self.pos_range
         return torch.rand(n, 2, device=self.device) * (hi - lo) + lo
 
+    def sample_center_joint(self, n, frac=0.4):
+        lo, hi = self.pos_range
+        mid, half = 0.5 * (lo + hi), 0.5 * (hi - lo) * frac
+        return torch.rand(n, 2, device=self.device) * (2 * half) + (mid - half)
+
     def joint_to_cart(self, theta):
         return theta                                  # the "joint" IS the cartesian position
 
@@ -246,6 +263,15 @@ class TwoJointArm(Effector):
         sho = torch.rand(n, 1, device=self.device) * (self.sho_range[1] - self.sho_range[0]) + self.sho_range[0]
         elb = torch.rand(n, 1, device=self.device) * (self.elb_range[1] - self.elb_range[0]) + self.elb_range[0]
         return torch.cat([sho, elb], dim=1)
+
+    def sample_center_joint(self, n, frac=0.4):
+        def ctr(rng):
+            mid, half = 0.5 * (rng[0] + rng[1]), 0.5 * (rng[1] - rng[0]) * frac
+            return torch.rand(n, 1, device=self.device) * (2 * half) + (mid - half)
+        return torch.cat([ctr(self.sho_range), ctr(self.elb_range)], dim=1)
+
+    def cartesian_force_to_perturbation(self, theta0, force_xy):
+        return arm_jacobian_T_force(theta0, force_xy)          # J^T F -> joint torque
 
     def joint_to_cart(self, theta):
         return arm_fingertip(theta, torch.zeros_like(theta))[:, :2]
@@ -314,6 +340,15 @@ class Arm26(Effector):
         sho = torch.rand(n, 1, device=self.device) * (self.sho_range[1] - self.sho_range[0]) + self.sho_range[0]
         elb = torch.rand(n, 1, device=self.device) * (self.elb_range[1] - self.elb_range[0]) + self.elb_range[0]
         return torch.cat([sho, elb], dim=1)
+
+    def sample_center_joint(self, n, frac=0.4):
+        def ctr(rng):
+            mid, half = 0.5 * (rng[0] + rng[1]), 0.5 * (rng[1] - rng[0]) * frac
+            return torch.rand(n, 1, device=self.device) * (2 * half) + (mid - half)
+        return torch.cat([ctr(self.sho_range), ctr(self.elb_range)], dim=1)
+
+    def cartesian_force_to_perturbation(self, theta0, force_xy):
+        return arm_jacobian_T_force(theta0, force_xy)          # J^T F -> joint torque
 
     def joint_to_cart(self, theta):
         return arm_fingertip(theta, torch.zeros_like(theta))[:, :2]

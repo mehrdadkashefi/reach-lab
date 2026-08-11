@@ -32,6 +32,23 @@ import numpy as np
 import torch
 
 
+# Unified instruction width shared across every task (matches HorizonSequence's stream):
+# 3 target slots x [x, y, on] + go. Single-target tasks can opt into this wider layout via
+# unified_input=True so one network can be trained on all tasks with a fixed input_dim.
+UNIFIED_INPUT_CHANNELS = 10
+
+
+def _pack_unified(inp4):
+    """Remap a native single-target stream (n, T, 4) = [x, y, on, go] into the 10-wide unified
+    layout: the target goes in slot 0, slots 1-2 stay off, and the go cue moves to the last
+    channel. Leaves the desired trajectory and everything else untouched."""
+    n, T, _ = inp4.shape
+    u = torch.zeros(n, T, UNIFIED_INPUT_CHANNELS, device=inp4.device, dtype=inp4.dtype)
+    u[..., 0:3] = inp4[..., 0:3]                      # slot-0 target: x, y, on
+    u[..., -1]  = inp4[..., 3]                        # go -> last channel
+    return u
+
+
 def _min_jerk_s(tau):
     """Minimum-jerk position interpolant s(tau) in [0,1], tau clamped to [0,1].
     s = 10 tau^3 - 15 tau^4 + 6 tau^5  (zero vel/acc at both ends)."""
@@ -127,11 +144,14 @@ class DelayedReaching:
     """Reach to a target after a go cue; some trials are no-go (hold at start)."""
     name = "delayed_reaching"
     input_channels = 4                    # [target_x, target_y, target_visible, go]
+    supports_unified = True               # can emit the 10-wide unified stream instead
 
     def __init__(self, effector, steps=100, go_range=(20, 50), prob_no_go=0.3,
                  desired_profile='step', mj_move_steps=30, go_pulse_ms=150,
+                 unified_input=False,
                  perturb_prob=0.0, perturb_mag=0.0, perturb_dur_ms=100, **kwargs):
         self.effector = effector
+        self.unified_input = bool(unified_input)
         self.steps = steps
         self.go_range = tuple(go_range)
         self.prob_no_go = prob_no_go
@@ -195,6 +215,8 @@ class DelayedReaching:
         inp[:, :, 0:2] = target.unsqueeze(1)
         inp[:, :, 2]   = 1.0              # target always visible in this task
         inp[:, :, 3]   = go_sig.float()
+        if self.unified_input:
+            inp = _pack_unified(inp)
 
         if self.desired_profile == 'step':
             desired = torch.where(go_mask.unsqueeze(-1), target.unsqueeze(1), start.unsqueeze(1))
@@ -237,13 +259,15 @@ class DelayedReachPosture:
     """
     name = "delayed_reach_posture"
     input_channels = 4                    # [target_x, target_y, target_visible, go]
+    supports_unified = True               # can emit the 10-wide unified stream instead
 
     def __init__(self, effector, init_range_ms=(300, 700), delay_range_ms=(300, 700),
                  move_ms=1200, final_range_ms=(300, 700),
                  final_input='null', prob_no_go=0.4, desired_profile='step',
-                 go_pulse_ms=150,
+                 go_pulse_ms=150, unified_input=False,
                  perturb_prob=0.0, perturb_mag=0.0, perturb_dur_ms=100, **kwargs):
         self.effector = effector
+        self.unified_input = bool(unified_input)
         self.prob_no_go = prob_no_go
         # go-cue input shape: a short pulse of go_pulse_ms at movement onset (default 150 ms).
         # None or <= 0 -> sustained cue that stays on for the whole move window (old behaviour).
@@ -339,6 +363,8 @@ class DelayedReachPosture:
         vis = show_target.float().unsqueeze(-1)                # (n, T, 1)
         xy  = target.unsqueeze(1) * vis                        # zero when target hidden
         inp = torch.cat([xy, vis, go.unsqueeze(-1)], dim=-1)   # (n, T, 4)
+        if self.unified_input:
+            inp = _pack_unified(inp)
 
         if self.desired_profile == 'step':
             reach = (in_move | in_final) & ~nogo                          # no-go trials hold at start
@@ -608,8 +634,233 @@ class HorizonSequence:
         return theta0, inp, desired, perturbation, timestamps
 
 
+class _HoldPostureBase:
+    """Shared machinery for the hold-posture tasks: hold at a central start posture while an
+    unobserved external force bumps the hand; the target/desired is always the start location,
+    so the network learns to resist the bump and return to the start as fast as it can.
+
+    The start posture is sampled from the central `center_frac` of the effector's range so the
+    bump doesn't slam the arm into a joint limit. The external force is a Cartesian fingertip
+    force (random direction, random magnitude in force_range_n); the effector converts it to its
+    native perturbation units (xy force for the point mass, J^T joint torque for the arms) at the
+    start posture. The force is applied to the plant only -- never shown in the instruction
+    stream. A catch_prob fraction of trials are catch trials with no bump at all (amplitude 0),
+    so the network also learns to keep holding when nothing happens. Subclasses implement
+    _force_envelope() to shape the force over time.
+
+    Instruction stream (single target = the start location, always visible, no go cue). With
+    unified_input=True it is emitted in the 10-wide unified layout (slot 0 = start), otherwise
+    in the native 4-wide [x, y, on, go] layout.
+    """
+    supports_unified = True
+    input_channels = 4                    # native; 10 when unified_input=True
+
+    def __init__(self, effector, onset_range_ms=(500, 1000), force_range_n=(1.0, 5.0),
+                 settle_ms=700, center_frac=0.4, catch_prob=0.3, unified_input=False,
+                 desired_profile='step', **kwargs):
+        self.effector = effector
+        self.unified_input = bool(unified_input)
+        self.center_frac = float(center_frac)
+        self.catch_prob = float(catch_prob)              # fraction of no-bump (catch) trials
+        self.force_lo, self.force_hi = float(force_range_n[0]), float(force_range_n[1])
+        ms2steps = lambda ms: max(1, round(ms / 1000 / effector.dt))
+        self.onset_lo, self.onset_hi = ms2steps(onset_range_ms[0]), ms2steps(onset_range_ms[1])
+        self.settle = ms2steps(settle_ms)
+        # episode length: latest onset + longest force window + settling time (set by subclass)
+        self.steps = self.onset_hi + self._max_force_steps() + self.settle
+
+    # -- subclass hooks --------------------------------------------------------------------
+    def _max_force_steps(self):
+        """Longest possible force window in steps (for sizing the episode)."""
+        raise NotImplementedError
+
+    def _sample_force_params(self, n, dev):
+        """Return a dict of per-trial force parameters (subclass-specific), plus 'onset' (n,)."""
+        raise NotImplementedError
+
+    def _force_envelope(self, tg, params, dev):
+        """(n, T) scalar force magnitude over time from the sampled params. tg is (1, T)."""
+        raise NotImplementedError
+
+    def _spec_force_params(self, spec, n, dev):
+        """Build force params from a spec dict (explicit onset/duration/amp/angle)."""
+        raise NotImplementedError
+
+    # -- shared batch ----------------------------------------------------------------------
+    def make_batch(self, n=None, spec=None):
+        """Random batch when spec is None (training), or an explicit batch from a spec dict.
+
+        spec keys (all optional; scalars broadcast, or give length-n lists):
+            start / start_space      : explicit start posture ((dof,) or (n, dof)); default =
+                                       a freshly sampled central posture. start_space 'joint'
+                                       (default) or 'cartesian'.
+            angle_deg                : bump direction(s) in degrees (default: evenly spread)
+            amp_n                    : bump magnitude(s) in N (default: force range midpoint)
+            onset_steps              : bump onset step (default: onset range midpoint)
+            + subclass-specific timing (dur_steps for pulse; ramp_steps for ramp)
+            steps                    : episode length (default: self.steps)
+        """
+        eff, dev, R = self.effector, self.effector.device, None
+        if spec is None:
+            if n is None:
+                raise ValueError("make_batch needs either n (random) or spec (explicit)")
+            theta0 = eff.sample_center_joint(n, self.center_frac)
+            T = self.steps
+            params = self._sample_force_params(n, dev)
+        else:
+            start = spec.get("start")
+            if start is None:
+                raise ValueError("hold-posture spec needs a 'start' posture")
+            start = torch.as_tensor(np.asarray(start, dtype=np.float32), device=dev)
+            if start.ndim == 1:
+                start = start.unsqueeze(0)
+            # n = max leading dim across start and the per-trial bump params (singletons broadcast)
+            lead = lambda k: np.asarray(spec[k]).shape[0] if (k in spec and np.asarray(spec[k]).ndim >= 1) else 1
+            n = max(start.shape[0], lead("angle_deg"), lead("amp_n"),
+                    lead("onset_steps"), lead("dur_steps"), lead("ramp_steps"))
+            if start.shape[0] == 1 and n > 1:
+                start = start.expand(n, -1).contiguous()
+            if spec.get("start_space", "joint") == "cartesian":
+                theta0 = eff.cartesian_to_joint(start)
+            else:
+                theta0 = start
+            T = int(spec.get("steps", self.steps))
+            params = self._spec_force_params(spec, n, dev)
+
+        start_xy = eff.joint_to_cart(theta0)                             # (n, 2) = hold target
+
+        # external Cartesian force -> native perturbation units, shaped over time
+        tg = torch.arange(T, device=dev).unsqueeze(0)                    # (1, T)
+        mag = self._force_envelope(tg, params, dev)                      # (n, T) newtons
+        ang = params['angle']                                            # (n,)
+        fdir = torch.stack([torch.cos(ang), torch.sin(ang)], dim=1)      # (n, 2) unit
+        pert_unit = eff.cartesian_force_to_perturbation(theta0, fdir)    # (n, pdim) per 1 N
+        perturbation = mag.unsqueeze(-1) * pert_unit.unsqueeze(1)        # (n, T, pdim)
+
+        # instruction stream: single target = the start location, always visible, no go cue
+        inp = torch.zeros(n, T, 4, device=dev)
+        inp[:, :, 0:2] = start_xy.unsqueeze(1)
+        inp[:, :, 2]   = 1.0
+        if self.unified_input:
+            inp = _pack_unified(inp)
+
+        # desired trajectory: hold at the start for the whole episode
+        desired = start_xy.unsqueeze(1).expand(n, T, 2).contiguous()
+
+        onset = params['onset']
+        timestamps = {
+            'bump_onset':  onset.long(),
+            'bump_end':    (onset + params['dur']).long(),
+            'episode_end': torch.full((n,), T, dtype=torch.long, device=dev),
+            'amp_n':       params['amp'],
+            'angle_deg':   ang * 180.0 / np.pi,
+            'is_catch':    (params['amp'] == 0),          # no external force this trial
+        }
+        return theta0, inp, desired, perturbation, timestamps
+
+    # -- helpers for subclasses ------------------------------------------------------------
+    def _common_random(self, n, dev):
+        """Onset, direction, and amplitude shared by both hold tasks. A catch_prob fraction of
+        trials are catch trials: the amplitude is zeroed, so no external force ever arrives and
+        the network must simply keep holding."""
+        onset = torch.randint(self.onset_lo, self.onset_hi + 1, (n,), device=dev)
+        angle = torch.rand(n, device=dev) * (2 * np.pi)
+        amp = torch.rand(n, device=dev) * (self.force_hi - self.force_lo) + self.force_lo
+        catch = torch.rand(n, device=dev) < self.catch_prob
+        amp = amp * (~catch).float()                     # no bump on catch trials
+        return onset, angle, amp
+
+    def _common_spec(self, spec, n, dev):
+        onset = _as_col(spec.get("onset_steps", (self.onset_lo + self.onset_hi) // 2),
+                        n, dev).squeeze(1)
+        ang_deg = _as_col(spec.get("angle_deg",
+                                   np.linspace(0, 360, n, endpoint=False)), n, dev,
+                          torch.float32).squeeze(1)
+        amp = _as_col(spec.get("amp_n", 0.5 * (self.force_lo + self.force_hi)),
+                      n, dev, torch.float32).squeeze(1)
+        return onset, ang_deg * np.pi / 180.0, amp
+
+
+class HoldPosturePulse(_HoldPostureBase):
+    """Hold posture against a brief rectangular force pulse (random onset, direction, magnitude,
+    and duration). The force is constant over [onset, onset+dur) then releases to zero."""
+    name = "hold_posture_pulse"
+
+    def __init__(self, effector, dur_range_ms=(100, 200), **kwargs):
+        ms2steps = lambda ms: max(1, round(ms / 1000 / effector.dt))
+        self.dur_lo, self.dur_hi = ms2steps(dur_range_ms[0]), ms2steps(dur_range_ms[1])
+        super().__init__(effector, **kwargs)
+
+    def _max_force_steps(self):
+        return self.dur_hi
+
+    def _sample_force_params(self, n, dev):
+        onset, angle, amp = self._common_random(n, dev)
+        dur = torch.randint(self.dur_lo, self.dur_hi + 1, (n,), device=dev)
+        return {'onset': onset, 'angle': angle, 'amp': amp, 'dur': dur}
+
+    def _spec_force_params(self, spec, n, dev):
+        onset, angle, amp = self._common_spec(spec, n, dev)
+        dur = _as_col(spec.get("dur_steps", (self.dur_lo + self.dur_hi) // 2), n, dev).squeeze(1)
+        return {'onset': onset, 'angle': angle, 'amp': amp, 'dur': dur}
+
+    def _force_envelope(self, tg, params, dev):
+        onset, dur, amp = params['onset'].unsqueeze(1), params['dur'].unsqueeze(1), params['amp'].unsqueeze(1)
+        win = (tg >= onset) & (tg < onset + dur)                         # (n, T)
+        return win.float() * amp
+
+
+class HoldPostureRamp(_HoldPostureBase):
+    """Hold posture against a slowly growing force ramp: the force rises linearly from 0 to a
+    random maximum over a random ramp duration (random onset), then releases to zero. (Set
+    hold_after_ramp=True to instead sustain the max force to the end of the episode -- a
+    force-field-style push rather than a transient.)"""
+    name = "hold_posture_ramp"
+
+    def __init__(self, effector, ramp_range_ms=(200, 600), hold_after_ramp=False, **kwargs):
+        ms2steps = lambda ms: max(1, round(ms / 1000 / effector.dt))
+        self.ramp_lo, self.ramp_hi = ms2steps(ramp_range_ms[0]), ms2steps(ramp_range_ms[1])
+        self.hold_after_ramp = bool(hold_after_ramp)
+        super().__init__(effector, **kwargs)
+
+    def _max_force_steps(self):
+        # if the force is sustained after the ramp, the "window" runs to the end of the episode;
+        # size the episode off the ramp itself and let settle cover the post-ramp hold.
+        return self.ramp_hi
+
+    def _sample_force_params(self, n, dev):
+        onset, angle, amp = self._common_random(n, dev)
+        ramp = torch.randint(self.ramp_lo, self.ramp_hi + 1, (n,), device=dev)
+        return {'onset': onset, 'angle': angle, 'amp': amp, 'dur': ramp}
+
+    def _spec_force_params(self, spec, n, dev):
+        onset, angle, amp = self._common_spec(spec, n, dev)
+        ramp = _as_col(spec.get("ramp_steps", (self.ramp_lo + self.ramp_hi) // 2), n, dev).squeeze(1)
+        return {'onset': onset, 'angle': angle, 'amp': amp, 'dur': ramp}
+
+    def _force_envelope(self, tg, params, dev):
+        onset, ramp, amp = params['onset'].unsqueeze(1), params['dur'].unsqueeze(1), params['amp'].unsqueeze(1)
+        frac = ((tg - onset).clamp(min=0).float() / ramp.float()).clamp(max=1.0)   # 0..1 ramp
+        active = (tg >= onset)
+        if not self.hold_after_ramp:
+            active = active & (tg < onset + ramp)                       # release after the ramp
+        return active.float() * frac * amp
+
+
 TASKS = {'delayed_reach': DelayedReaching, 'delayed_reach_posture': DelayedReachPosture,
-         'horizon_sequence': HorizonSequence}
+         'horizon_sequence': HorizonSequence,
+         'hold_posture_pulse': HoldPosturePulse, 'hold_posture_ramp': HoldPostureRamp}
+
+
+def task_input_channels(name, unified_input=False):
+    """Instruction-stream width the effector should be built with for a given task. Single-target
+    tasks widen to UNIFIED_INPUT_CHANNELS when unified_input=True; the sequence task is always
+    its native width."""
+    cls = TASKS[name]
+    if unified_input and getattr(cls, 'supports_unified', False):
+        return UNIFIED_INPUT_CHANNELS
+    return cls.input_channels
+
 
 def make_task(name, effector, **kwargs):
     return TASKS[name](effector, **kwargs)

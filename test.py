@@ -50,7 +50,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from effectors import make_effector
-from tasks import make_task, TASKS
+from tasks import make_task, TASKS, task_input_channels
 from controllers import GRUController, ModularGRU
 from utils import fig_reaches, fig_diagnostics
 
@@ -79,14 +79,27 @@ def build_task(cfg, effector):
     name = cfg["task"]
     # go-cue pulse the model trained with; configs predating the pulse get 0 = sustained cue
     go_pulse_ms = cfg.get("go_pulse_ms", 0)
+    unified = cfg.get("unified_input", False)
     if name == "delayed_reach":
         kw = dict(steps=cfg.get("steps", 100) or 100,
                   go_range=cfg.get("go_range", [20, 50]),
-                  go_pulse_ms=go_pulse_ms)
+                  go_pulse_ms=go_pulse_ms, unified_input=unified)
         if cfg.get("prob_no_go") is not None: kw["prob_no_go"] = cfg["prob_no_go"]
         return make_task(name, effector, **kw)
+    elif name in ("hold_posture_pulse", "hold_posture_ramp"):
+        kw = {"unified_input": unified}
+        if cfg.get("onset_range_ms") is not None: kw["onset_range_ms"] = tuple(cfg["onset_range_ms"])
+        if cfg.get("force_range_n")  is not None: kw["force_range_n"]  = tuple(cfg["force_range_n"])
+        if cfg.get("center_frac")    is not None: kw["center_frac"]    = cfg["center_frac"]
+        if cfg.get("catch_prob")     is not None: kw["catch_prob"]     = cfg["catch_prob"]
+        if name == "hold_posture_pulse":
+            if cfg.get("dur_range_ms") is not None: kw["dur_range_ms"] = tuple(cfg["dur_range_ms"])
+        else:
+            if cfg.get("ramp_range_ms")  is not None: kw["ramp_range_ms"]   = tuple(cfg["ramp_range_ms"])
+            if cfg.get("hold_after_ramp") is not None: kw["hold_after_ramp"] = cfg["hold_after_ramp"]
+        return make_task(name, effector, **kw)
     elif name == "delayed_reach_posture":
-        kw = {"go_pulse_ms": go_pulse_ms}
+        kw = {"go_pulse_ms": go_pulse_ms, "unified_input": unified}
         if cfg.get("init_range_ms")  is not None: kw["init_range_ms"]  = tuple(cfg["init_range_ms"])
         if cfg.get("delay_range_ms") is not None: kw["delay_range_ms"] = tuple(cfg["delay_range_ms"])
         if cfg.get("move_ms")        is not None: kw["move_ms"]        = cfg["move_ms"]
@@ -116,7 +129,8 @@ def load_experiment(folder, device):
     eff = make_effector(cfg["effector"], dt=cfg.get("dt", 0.01),
                         vis_delay_ms=cfg.get("vis_delay_ms", 70),
                         pro_delay_ms=cfg.get("pro_delay_ms", 25),
-                        task_dim=TASKS[cfg["task"]].input_channels).to(device)
+                        task_dim=task_input_channels(cfg["task"],
+                                                     cfg.get("unified_input", False))).to(device)
     controller = build_controller(cfg, eff).to(device)
     task = build_task(cfg, eff)
 
@@ -144,6 +158,8 @@ def _apply_task_timing(cfg, spec):
     elif cfg.get("task") == "horizon_sequence":
         spec.setdefault("init_steps", 40);  spec.setdefault("delay_steps", 50)
         spec.setdefault("dwell_steps", 50); spec.setdefault("final_steps", 40)
+    elif cfg.get("task") in ("hold_posture_pulse", "hold_posture_ramp"):
+        pass                                                    # timing sampled by the task itself
     else:                                                        # delayed_reach_posture
         spec.setdefault("init_steps", 40);  spec.setdefault("delay_steps", 50)
         spec.setdefault("move_steps", 120); spec.setdefault("final_steps", 40)
@@ -227,8 +243,31 @@ def spec_sequence(cfg, effector):
     return _apply_task_timing(cfg, spec)
 
 
+def spec_hold(cfg, effector, n_dirs=8):
+    """Hold-posture bump set: hold at the workspace-center posture while a fixed-magnitude bump
+    is delivered in each of n_dirs evenly-spaced directions. Onset/duration at the range
+    midpoints (deterministic). Only applies to the hold_posture_* tasks."""
+    if cfg.get("task") not in ("hold_posture_pulse", "hold_posture_ramp"):
+        return None
+    if effector.name == "point_mass":
+        lo, hi = effector.pos_range
+        center = [[0.5 * (lo + hi)] * 2]
+        start_space = "cartesian"
+    else:
+        sho = 0.5 * (effector.sho_range[0] + effector.sho_range[1])
+        elb = 0.5 * (effector.elb_range[0] + effector.elb_range[1])
+        center = [[sho, elb]]
+        start_space = "joint"
+    angles = np.linspace(0, 360, n_dirs, endpoint=False).tolist()
+    amp = 0.5 * (cfg.get("force_range_n") or [1.0, 5.0])[0] + \
+          0.5 * (cfg.get("force_range_n") or [1.0, 5.0])[1]
+    spec = {"start_space": start_space, "start": center[0],
+            "angle_deg": angles, "amp_n": amp}
+    return _apply_task_timing(cfg, spec)
+
+
 BUILTIN_SPECS = {"center_out": spec_center_out, "point2point": spec_point2point,
-                 "sequence": spec_sequence}
+                 "sequence": spec_sequence, "hold": spec_hold}
 
 
 # ----------------------------------------------------------------------------- run one folder
@@ -301,7 +340,7 @@ def main():
     ap.add_argument("--spec", action="append", default=None,
                     help="path to a user JSON spec; repeatable. Each is named by its filename "
                          "and run in addition to the built-in specs.")
-    ap.add_argument("--builtin", default="center_out,point2point,sequence",
+    ap.add_argument("--builtin", default="center_out,point2point,sequence,hold",
                     help="comma-separated built-in specs to run "
                          f"(choices: {', '.join(BUILTIN_SPECS)}; pass 'none' to skip them)")
     ap.add_argument("--device", default="cpu")

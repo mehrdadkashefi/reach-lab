@@ -76,6 +76,26 @@ def arm_step(theta, omega, tau, dt: float = 0.01,
 
 
 @torch.jit.script
+def arm_jacobian_T_force(theta, force_xy):
+    """Map a Cartesian fingertip force to joint torque: tau = J(theta)^T @ F.
+    theta, force_xy: (batch, 2).  Returns joint torque (batch, 2) = [shoulder, elbow].
+    J is the fingertip-position Jacobian (the linear-velocity block of arm_fingertip)."""
+    l1 = 0.309; l2 = 0.333
+    sho = theta[:, 0]
+    s = sho + theta[:, 1]
+    s1 = torch.sin(sho); c1 = torch.cos(sho)
+    s12 = torch.sin(s);  c12 = torch.cos(s)
+    # J = [[-l1 s1 - l2 s12, -l2 s12],
+    #      [ l1 c1 + l2 c12,  l2 c12]]
+    j11 = -(l1 * s1 + l2 * s12); j12 = -l2 * s12
+    j21 =  (l1 * c1 + l2 * c12); j22 =  l2 * c12
+    fx = force_xy[:, 0]; fy = force_xy[:, 1]
+    tau_s = j11 * fx + j21 * fy
+    tau_e = j12 * fx + j22 * fy
+    return torch.stack([tau_s, tau_e], dim=1)
+
+
+@torch.jit.script
 def arm_fingertip(theta, omega):
     """Forward kinematics: joint state -> fingertip (x, y, vx, vy).  theta, omega: (batch, 2)."""
     l1 = 0.309; l2 = 0.333
