@@ -50,7 +50,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from effectors import make_effector
-from tasks import make_task
+from tasks import make_task, TASKS
 from controllers import GRUController, ModularGRU
 from utils import fig_reaches, fig_diagnostics
 
@@ -94,6 +94,17 @@ def build_task(cfg, effector):
         if cfg.get("final_input")    is not None: kw["final_input"]    = cfg["final_input"]
         if cfg.get("prob_no_go")     is not None: kw["prob_no_go"]     = cfg["prob_no_go"]
         return make_task(name, effector, **kw)
+    elif name == "horizon_sequence":
+        kw = {"go_pulse_ms": go_pulse_ms}
+        if cfg.get("n_reaches")        is not None: kw["n_reaches"]        = cfg["n_reaches"]
+        if cfg.get("init_range_ms")    is not None: kw["init_range_ms"]    = tuple(cfg["init_range_ms"])
+        if cfg.get("delay_range_ms")   is not None: kw["delay_range_ms"]   = tuple(cfg["delay_range_ms"])
+        if cfg.get("dwell_range_ms")   is not None: kw["dwell_range_ms"]   = tuple(cfg["dwell_range_ms"])
+        if cfg.get("final_range_ms")   is not None: kw["final_range_ms"]   = tuple(cfg["final_range_ms"])
+        if cfg.get("horizon_probs")    is not None: kw["horizon_probs"]    = tuple(cfg["horizon_probs"])
+        if cfg.get("prob_no_go")       is not None: kw["prob_no_go"]       = cfg["prob_no_go"]
+        if cfg.get("prob_no_go_reach") is not None: kw["prob_no_go_reach"] = cfg["prob_no_go_reach"]
+        return make_task(name, effector, **kw)
     raise ValueError(f"unknown task in config: {name!r}")
 
 
@@ -104,7 +115,8 @@ def load_experiment(folder, device):
 
     eff = make_effector(cfg["effector"], dt=cfg.get("dt", 0.01),
                         vis_delay_ms=cfg.get("vis_delay_ms", 70),
-                        pro_delay_ms=cfg.get("pro_delay_ms", 25)).to(device)
+                        pro_delay_ms=cfg.get("pro_delay_ms", 25),
+                        task_dim=TASKS[cfg["task"]].input_channels).to(device)
     controller = build_controller(cfg, eff).to(device)
     task = build_task(cfg, eff)
 
@@ -129,6 +141,9 @@ def _apply_task_timing(cfg, spec):
         total = int(cfg.get("steps", 100) or 100)
         spec.setdefault("steps", total)
         spec.setdefault("go_time", min(30, total // 3))          # fixed (deterministic) go onset
+    elif cfg.get("task") == "horizon_sequence":
+        spec.setdefault("init_steps", 40);  spec.setdefault("delay_steps", 50)
+        spec.setdefault("dwell_steps", 50); spec.setdefault("final_steps", 40)
     else:                                                        # delayed_reach_posture
         spec.setdefault("init_steps", 40);  spec.setdefault("delay_steps", 50)
         spec.setdefault("move_steps", 120); spec.setdefault("final_steps", 40)
@@ -138,7 +153,10 @@ def _apply_task_timing(cfg, spec):
 
 def spec_center_out(cfg, effector, n_dirs=8, radius=0.10):
     """Center-out reach set: start from a single central posture and fan out to n_dirs targets
-    on a circle. Timing matches the trained task. Returns a flat spec dict."""
+    on a circle. Timing matches the trained task. Returns a flat spec dict, or None for tasks
+    this spec doesn't apply to (horizon_sequence)."""
+    if cfg.get("task") == "horizon_sequence":
+        return None
     if effector.name == "point_mass":
         lo, hi = effector.pos_range
         center_xy = np.array([[0.5 * (lo + hi)] * 2], dtype=np.float32)
@@ -165,8 +183,10 @@ def spec_point2point(cfg, effector, points_xy=None):
     With the default five points (four corners + centre of a rectangle) this yields 5*4 = 20
     conditions (each point reaches to every other). Start and target are both cartesian; for the
     arms the start is mapped to a joint config via the effector's inverse kinematics. Timing
-    matches the trained task. Returns a flat spec dict.
+    matches the trained task. Returns a flat spec dict, or None for horizon_sequence.
     """
+    if cfg.get("task") == "horizon_sequence":
+        return None
     pts = np.asarray(points_xy if points_xy is not None else POINT2POINT_XY, dtype=np.float32)
     starts = [pts[i] for i in range(len(pts)) for j in range(len(pts)) if i != j]
     targets = [pts[j] for i in range(len(pts)) for j in range(len(pts)) if i != j]
@@ -175,8 +195,40 @@ def spec_point2point(cfg, effector, points_xy=None):
     return _apply_task_timing(cfg, spec)
 
 
-# name -> builder(cfg, effector). Both are run by default; restrict with --builtin.
-BUILTIN_SPECS = {"center_out": spec_center_out, "point2point": spec_point2point}
+# name -> builder(cfg, effector). A builder may return None when the spec doesn't apply to the
+# trained task (e.g. reach specs on horizon_sequence and vice versa); such specs are skipped.
+def spec_sequence(cfg, effector):
+    """One fixed target sequence run at horizon 1, 2, and 3 (3 trials), so the same movement
+    can be compared across planning horizons. Deterministic (seeded) start + targets sampled
+    from the trained workspace; timing at each range's midpoint via the task's own defaults.
+    Only applies to horizon_sequence models."""
+    if cfg.get("task") != "horizon_sequence":
+        return None
+    R = int(cfg.get("n_reaches") or 7)
+    g = torch.Generator().manual_seed(0)
+    if effector.name == "point_mass":
+        lo, hi = effector.pos_range
+        pts = torch.rand(R + 1, 2, generator=g) * (hi - lo) + lo
+        start, targets = pts[0], pts[1:]
+        start_space = "cartesian"
+        start_val = start.tolist()
+    else:
+        sho = torch.rand(R + 1, 1, generator=g) * (effector.sho_range[1] - effector.sho_range[0]) \
+              + effector.sho_range[0]
+        elb = torch.rand(R + 1, 1, generator=g) * (effector.elb_range[1] - effector.elb_range[0]) \
+              + effector.elb_range[0]
+        joints = torch.cat([sho, elb], dim=1)
+        targets = effector.joint_to_cart(joints[1:].to(effector.device)).cpu()
+        start_space = "joint"
+        start_val = joints[0].tolist()
+    spec = {"start_space": start_space, "target_space": "cartesian",
+            "start": start_val, "targets": targets.tolist(),
+            "horizon": [1, 2, 3]}                          # same sequence, three horizons
+    return _apply_task_timing(cfg, spec)
+
+
+BUILTIN_SPECS = {"center_out": spec_center_out, "point2point": spec_point2point,
+                 "sequence": spec_sequence}
 
 
 # ----------------------------------------------------------------------------- run one folder
@@ -234,6 +286,9 @@ def run_folder(folder, named_specs, device, obs_noise, neural_noise, num_plot, s
     results = {}
     for name, spec in named_specs:
         s = spec(cfg, eff) if callable(spec) else spec
+        if s is None:                                     # builtin not applicable to this task
+            print(f"      {name:12s} skipped (not applicable to task {cfg['task']!r})")
+            continue
         results[name] = _run_one_spec(folder, name, s, eff, controller, task, cfg,
                                       obs_noise, neural_noise, num_plot, seed)
     return results
@@ -246,7 +301,7 @@ def main():
     ap.add_argument("--spec", action="append", default=None,
                     help="path to a user JSON spec; repeatable. Each is named by its filename "
                          "and run in addition to the built-in specs.")
-    ap.add_argument("--builtin", default="center_out,point2point",
+    ap.add_argument("--builtin", default="center_out,point2point,sequence",
                     help="comma-separated built-in specs to run "
                          f"(choices: {', '.join(BUILTIN_SPECS)}; pass 'none' to skip them)")
     ap.add_argument("--device", default="cpu")

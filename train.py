@@ -12,7 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from effectors import make_effector
-from tasks import make_task
+from tasks import make_task, TASKS
 from controllers import GRUController, ModularGRU
 
 from utils import fig_reaches, fig_diagnostics, fig_learning_curve
@@ -24,7 +24,8 @@ def list_of_int(s):   return [int(x) for x in s.split(',')]
 p = argparse.ArgumentParser()
 # --- main / training ---
 p.add_argument("--effector", choices=["point_mass", "arm_torque", "arm26"], default="arm26")
-p.add_argument("--task", choices=["delayed_reach", "delayed_reach_posture"], default="delayed_reach")
+p.add_argument("--task", choices=["delayed_reach", "delayed_reach_posture", "horizon_sequence"],
+               default="delayed_reach")
 p.add_argument("--desired-profile", choices=["step", "min_jerk"], default="step",
                help="target trajectory the position loss regresses against: 'step' (jump to "
                     "target at go) or 'min_jerk' (straight-line minimum-jerk reach)")
@@ -88,6 +89,15 @@ p.add_argument("--move-ms",        type=int,         default=None)
 p.add_argument("--final-range-ms", type=list_of_int, default=None)
 p.add_argument("--final-input",    choices=["null", "target"], default=None)
 p.add_argument("--prob-no-go",     type=float,       default=None, help="fraction of no-go trials")
+# horizon_sequence (also reuses --init/--delay/--final-range-ms and --prob-no-go above)
+p.add_argument("--n-reaches",      type=int,         default=None, help="sequence length (default 7)")
+p.add_argument("--dwell-range-ms", type=list_of_int, default=None,
+               help="per-reach segment duration range (move + hold at target), ms")
+p.add_argument("--horizon-probs",  type=list_of_float, default=None,
+               help="P(horizon = 1, 2, 3); default uniform")
+p.add_argument("--prob-no-go-reach", type=float,     default=None,
+               help="fraction of trials where one random capture gets no go pulse "
+                    "(hold at the captured target; sequence aborts)")
 # --- controller config ---
 p.add_argument("--hidden-dim", type=int, default=128, help="baseline gru hidden size")
 # modular overrides: leave as None to use ModularGRU's own defaults
@@ -117,7 +127,8 @@ print(f"saving results to {run_dir}")
 
 # ----------------------------------------------------------------------------- effector + task
 eff = make_effector(args.effector, dt=args.dt,
-                    vis_delay_ms=args.vis_delay_ms, pro_delay_ms=args.pro_delay_ms).to(device)
+                    vis_delay_ms=args.vis_delay_ms, pro_delay_ms=args.pro_delay_ms,
+                    task_dim=TASKS[args.task].input_channels).to(device)
 
 perturb_kw = {'perturb_prob': args.perturb_prob, 'perturb_mag': args.perturb_mag,
               'perturb_dur_ms': args.perturb_dur_ms, 'go_pulse_ms': args.go_pulse_ms}
@@ -134,8 +145,23 @@ elif args.task == "delayed_reach_posture":
     if args.final_input    is not None: tk['final_input']    = args.final_input
     if args.prob_no_go     is not None: tk['prob_no_go']     = args.prob_no_go
     task = make_task(args.task, eff, **tk)
+elif args.task == "horizon_sequence":
+    sk = {'desired_profile': args.desired_profile, **perturb_kw}
+    if args.n_reaches        is not None: sk['n_reaches']        = args.n_reaches
+    if args.init_range_ms    is not None: sk['init_range_ms']    = tuple(args.init_range_ms)
+    if args.delay_range_ms   is not None: sk['delay_range_ms']   = tuple(args.delay_range_ms)
+    if args.dwell_range_ms   is not None: sk['dwell_range_ms']   = tuple(args.dwell_range_ms)
+    if args.final_range_ms   is not None: sk['final_range_ms']   = tuple(args.final_range_ms)
+    if args.horizon_probs    is not None: sk['horizon_probs']    = tuple(args.horizon_probs)
+    if args.prob_no_go       is not None: sk['prob_no_go']       = args.prob_no_go
+    if args.prob_no_go_reach is not None: sk['prob_no_go_reach'] = args.prob_no_go_reach
+    task = make_task(args.task, eff, **sk)
 else:
     raise ValueError(f"Invalid task: {args.task}")
+if args.task == "horizon_sequence" and args.w_loss_urgency > 0:
+    print("WARNING: --w-loss-urgency penalizes distance to the FINAL target after the first go, "
+          "which is wrong for a reach sequence (it fights dwelling at intermediate targets); "
+          "consider leaving it at 0 for horizon_sequence.")
 print(f"effector: {eff.name}  (input_dim={eff.input_dim}, output_dim={eff.output_dim}, "
       f"vis_d={eff.vis_d}, pro_d={eff.pro_d})")
 print(f"task: {task.name}  (episode {task.steps} steps = {task.steps * args.dt:.2f} s)")

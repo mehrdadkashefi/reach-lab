@@ -126,6 +126,7 @@ def _random_perturbation(eff, n, T, device, prob, mag, dur_steps):
 class DelayedReaching:
     """Reach to a target after a go cue; some trials are no-go (hold at start)."""
     name = "delayed_reaching"
+    input_channels = 4                    # [target_x, target_y, target_visible, go]
 
     def __init__(self, effector, steps=100, go_range=(20, 50), prob_no_go=0.3,
                  desired_profile='step', mj_move_steps=30, go_pulse_ms=150,
@@ -235,6 +236,7 @@ class DelayedReachPosture:
     extends the (uninformative) initial hold.
     """
     name = "delayed_reach_posture"
+    input_channels = 4                    # [target_x, target_y, target_visible, go]
 
     def __init__(self, effector, init_range_ms=(300, 700), delay_range_ms=(300, 700),
                  move_ms=1200, final_range_ms=(300, 700),
@@ -359,7 +361,255 @@ class DelayedReachPosture:
         return theta0, inp, desired, perturbation, timestamps
 
 
-TASKS = {'delayed_reach': DelayedReaching, 'delayed_reach_posture': DelayedReachPosture}
+class HorizonSequence:
+    """Delayed *sequence* of reaches with a limited planning horizon.
+
+    Trial structure (segments sampled per trial; random trials are right-aligned so any
+    slack extends the uninformative initial hold, like DelayedReachPosture):
+
+        1. initial hold : hand at the start posture, no targets shown, go = 0.
+                                                          duration ~ init_range_ms
+        2. delay        : the first min(horizon, n_reaches) targets are shown, go = 0;
+                          keep holding at the start.       duration ~ delay_range_ms
+        3. sequence     : a go *pulse* (go_pulse_ms) fires and the hand reaches target 1.
+                          Each reach owns one dwell segment covering both the movement and
+                          the hold at the target (the network budgets the time itself). At
+                          the end of a segment the target is "captured": it disappears, the
+                          remaining targets shift one slot forward (conveyor: slot 1 always
+                          holds the current target), and a fresh go pulse cues the next
+                          reach.                 duration ~ dwell_range_ms per reach
+        4. final hold   : after the last capture all slots are off; hold at the last
+                          target.                          duration ~ final_range_ms
+
+    Horizon: each trial runs at a horizon h drawn from {1..3} (horizon_probs). Slot j
+    (j = 1..3) shows the (current + j - 1)-th remaining target if j <= h and that target
+    exists, else the slot is off (x = y = 0, on = 0). The instruction stream is therefore
+    always 3 slots x [x, y, on] + go = 10 channels.
+
+    No-go variants (independent):
+        prob_no_go       : the go pulse never fires; the targets stay as in the delay and
+                           the hand must hold at the start posture the whole episode.
+        prob_no_go_reach : one random capture k >= 2 delivers no go pulse; the next target
+                           appears in slot 1 but the hand must hold at the just-captured
+                           target for the rest of the episode (the sequence aborts). This
+                           teaches "move only on a pulse", per reach.
+
+    The desired trajectory jumps to the current target at each go pulse ('step') or ramps
+    to it with a minimum-jerk profile over mj_move_steps ('min_jerk'), then holds.
+    """
+    name = "horizon_sequence"
+    n_slots = 3
+    input_channels = 3 * n_slots + 1      # 3 x [x, y, on] + go = 10
+
+    def __init__(self, effector, n_reaches=7,
+                 init_range_ms=(300, 700), delay_range_ms=(300, 700),
+                 dwell_range_ms=(400, 600), final_range_ms=(300, 700),
+                 horizon_probs=(1/3, 1/3, 1/3),
+                 prob_no_go=0.15, prob_no_go_reach=0.0,
+                 desired_profile='step', mj_move_steps=30, go_pulse_ms=150,
+                 perturb_prob=0.0, perturb_mag=0.0, perturb_dur_ms=100, **kwargs):
+        self.effector = effector
+        self.n_reaches = int(n_reaches)
+        hp = torch.as_tensor(horizon_probs, dtype=torch.float32)
+        assert hp.numel() == self.n_slots and abs(hp.sum().item() - 1.0) < 1e-4, \
+            f"horizon_probs must be {self.n_slots} probabilities summing to 1"
+        self.horizon_probs = hp
+        self.prob_no_go = float(prob_no_go)
+        self.prob_no_go_reach = float(prob_no_go_reach)
+        assert desired_profile in ('step', 'min_jerk')
+        self.desired_profile = desired_profile
+        self.mj_move_steps = int(mj_move_steps)
+        # go-cue input shape: a short pulse at the initial go and at every capture.
+        # None or <= 0 -> sustained cue that stays on for the whole sequence (rarely useful).
+        self.go_pulse = (None if (go_pulse_ms is None or go_pulse_ms <= 0)
+                         else max(1, round(go_pulse_ms / 1000 / effector.dt)))
+        # random training perturbations (applied to the plant, not observed by the controller)
+        self.perturb_prob = float(perturb_prob)
+        self.perturb_mag = float(perturb_mag)
+        self.perturb_dur = max(1, round(perturb_dur_ms / 1000 / effector.dt))
+
+        ms2steps = lambda ms: max(1, round(ms / 1000 / effector.dt))
+        self.init_lo,  self.init_hi  = ms2steps(init_range_ms[0]),  ms2steps(init_range_ms[1])
+        self.delay_lo, self.delay_hi = ms2steps(delay_range_ms[0]), ms2steps(delay_range_ms[1])
+        self.dwell_lo, self.dwell_hi = ms2steps(dwell_range_ms[0]), ms2steps(dwell_range_ms[1])
+        self.final_lo, self.final_hi = ms2steps(final_range_ms[0]), ms2steps(final_range_ms[1])
+        self.steps = (self.init_hi + self.delay_hi
+                      + self.n_reaches * self.dwell_hi + self.final_hi)
+
+    # -- spec helpers ------------------------------------------------------------------
+    def _resolve_spec_geometry(self, spec, dev):
+        """start ((dof,) or (n, dof)) + targets ((n_reaches, 2) or (n, n_reaches, 2)) -> tensors.
+        start_space ('joint') / target_space ('cartesian') select interpretation. n is the max
+        leading dim over start / targets / horizon / no_go / no_go_reach (singletons broadcast).
+        """
+        eff, R = self.effector, self.n_reaches
+        start   = np.asarray(spec["start"],   dtype=np.float32)
+        targets = np.asarray(spec["targets"], dtype=np.float32)
+        if start.ndim == 1:   start = start[None]                        # (1, dof)
+        if targets.ndim == 2: targets = targets[None]                    # (1, R, 2)
+        assert targets.shape[1] == R, \
+            f"spec 'targets' must have {R} reaches per trial, got {targets.shape[1]}"
+        lead = lambda k: np.asarray(spec[k]).shape[0] if (k in spec and np.asarray(spec[k]).ndim >= 1) else 1
+        n = max(start.shape[0], targets.shape[0], lead("horizon"), lead("no_go"), lead("no_go_reach"))
+        if start.shape[0]   == 1 and n > 1: start   = np.repeat(start, n, 0)
+        if targets.shape[0] == 1 and n > 1: targets = np.repeat(targets, n, 0)
+
+        start_t = torch.as_tensor(start, device=dev)
+        if spec.get("start_space", "joint") == "joint":
+            theta0 = start_t
+        else:
+            theta0 = eff.cartesian_to_joint(start_t)
+
+        tt = torch.as_tensor(targets, device=dev)                        # (n, R, 2)
+        if spec.get("target_space", "cartesian") == "joint":
+            tt = eff.joint_to_cart(tt.reshape(n * R, -1)).reshape(n, R, 2)
+        return theta0.to(dev), tt.to(dev), n
+
+    def make_batch(self, n=None, spec=None):
+        """Random batch when spec is None (training), or an explicit batch from a spec dict.
+
+        spec keys (start/targets required; scalars broadcast, or give length-n lists):
+            start / targets          : start config (dof,) and target sequence (n_reaches, 2)
+                                       per trial (see start_space/target_space)
+            start_space  ('joint')   : 'joint' or 'cartesian'
+            target_space ('cartesian'): 'cartesian' or 'joint'
+            horizon                  : 1..3 (default 3); scalar or length-n
+            init_steps / delay_steps / final_steps : segment durations in steps
+                                       (defaults: each range's midpoint)
+            dwell_steps              : per-reach segment length; scalar, (n_reaches,) or
+                                       (n, n_reaches) (default: dwell range midpoint)
+            no_go        (False)     : trial-level no-go (never any go pulse)
+            no_go_reach  (-1)        : index (1..n_reaches-1) of a reach whose pulse is
+                                       withheld (sequence aborts there); -1 = none
+            go_pulse_steps           : go-cue pulse length in steps (default: task's
+                                       go_pulse_ms; 0 or negative -> sustained cue)
+            perturbation             : {'value', 't_start', 't_end'} or None
+        """
+        eff, dev, R = self.effector, self.effector.device, self.n_reaches
+        mid = lambda lo, hi: (lo + hi) // 2
+
+        if spec is None:
+            if n is None:
+                raise ValueError("make_batch needs either n (random) or spec (explicit)")
+            theta0  = eff.sample_joint(n)
+            targets = eff.joint_to_cart(eff.sample_joint(n * R)).reshape(n, R, 2)
+            T = self.steps
+            d1   = torch.randint(self.init_lo,  self.init_hi + 1,  (n, 1), device=dev)
+            d2   = torch.randint(self.delay_lo, self.delay_hi + 1, (n, 1), device=dev)
+            dseg = torch.randint(self.dwell_lo, self.dwell_hi + 1, (n, R), device=dev)
+            d4   = torch.randint(self.final_lo, self.final_hi + 1, (n, 1), device=dev)
+            pre  = T - (d1 + d2 + dseg.sum(1, keepdim=True) + d4)       # slack -> initial hold
+            t_delay = pre + d1
+            t_go    = t_delay + d2
+            horizon = torch.multinomial(self.horizon_probs.to(dev), n, replacement=True) + 1
+            nogo    = torch.rand(n, device=dev) < self.prob_no_go                     # (n,)
+            hit_r   = (torch.rand(n, device=dev) < self.prob_no_go_reach) & ~nogo & (R > 1)
+            ridx    = torch.randint(1, max(2, R), (n,), device=dev)
+            no_go_reach = torch.where(hit_r, ridx, torch.full_like(ridx, -1))         # (n,)
+            pulse = self.go_pulse
+            perturbation = _random_perturbation(eff, n, T, dev,
+                                                self.perturb_prob, self.perturb_mag, self.perturb_dur)
+        else:
+            theta0, targets, n = self._resolve_spec_geometry(spec, dev)
+            d1 = _as_col(spec.get("init_steps",  mid(self.init_lo,  self.init_hi)),  n, dev)
+            d2 = _as_col(spec.get("delay_steps", mid(self.delay_lo, self.delay_hi)), n, dev)
+            dw = np.broadcast_to(np.asarray(spec.get("dwell_steps",
+                                                     mid(self.dwell_lo, self.dwell_hi))), (n, R))
+            dseg = torch.as_tensor(np.array(dw), device=dev).long()                  # (n, R)
+            d4 = _as_col(spec.get("final_steps", mid(self.final_lo, self.final_hi)), n, dev)
+            T = int((d1 + d2 + dseg.sum(1, keepdim=True) + d4).max().item())
+            t_delay = d1                                                # left-aligned
+            t_go    = d1 + d2
+            horizon = _as_col(spec.get("horizon", self.n_slots), n, dev).squeeze(1)
+            horizon = horizon.clamp(1, self.n_slots)
+            nogo    = _as_col(spec.get("no_go", False), n, dev, torch.bool).squeeze(1)
+            no_go_reach = _as_col(spec.get("no_go_reach", -1), n, dev).squeeze(1)
+            pulse = self.go_pulse
+            if spec.get("go_pulse_steps") is not None:
+                p = int(spec["go_pulse_steps"])
+                pulse = p if p > 0 else None
+            perturbation = _constant_perturbation(eff, spec.get("perturbation"), n, T, dev)
+
+        start = eff.joint_to_cart(theta0)                               # (n, 2)
+        bounds = t_go + dseg.cumsum(1)                                  # (n, R) capture times
+        pulse_times = torch.cat([t_go, bounds[:, :-1]], dim=1)          # (n, R) go for reach k
+        final_start = bounds[:, -1]                                     # (n,)
+
+        # cap = how far the sequence actually runs: R normally, 0 on trial no-go, r on a
+        # reach no-go (reach r is cued r < cap; slot content / desired freeze at cap).
+        cap = torch.full((n,), R, dtype=torch.long, device=dev)
+        cap = torch.where(nogo, torch.zeros_like(cap), cap)
+        has_r = no_go_reach >= 0
+        cap = torch.where(has_r, no_go_reach.clamp(1, R), cap)
+
+        tg = torch.arange(T, device=dev).unsqueeze(0)                   # (1, T)
+        cur = (tg.unsqueeze(-1) >= bounds.unsqueeze(1)).sum(-1)         # (n, T) captures so far
+        cur_eff = torch.minimum(cur, cap.unsqueeze(1))                  # frozen on no-go variants
+        shown_time = tg >= t_delay                                      # targets visible from delay
+
+        # ---- instruction stream: 3 slots x [x, y, on] + go --------------------------------
+        inp = torch.zeros(n, T, self.input_channels, device=dev)
+        tx, ty = targets[..., 0], targets[..., 1]                       # (n, R)
+        for j in range(self.n_slots):
+            idx = cur_eff + j                                           # target index in slot j
+            on = (idx < R) & (j < horizon.unsqueeze(1)) & shown_time
+            idxc = idx.clamp(max=R - 1)
+            inp[:, :, 3 * j]     = tx.gather(1, idxc) * on.float()
+            inp[:, :, 3 * j + 1] = ty.gather(1, idxc) * on.float()
+            inp[:, :, 3 * j + 2] = on.float()
+
+        # go channel: one pulse per cued reach (k < cap), at t_go and at each capture
+        go = torch.zeros(n, T, device=dev)
+        if pulse is None:                                               # sustained fallback
+            go = ((tg >= t_go) & (cur < cap.unsqueeze(1))).float()
+        else:
+            for k in range(R):
+                pk = pulse_times[:, k:k + 1]                            # (n, 1)
+                win = (tg >= pk) & (tg < pk + pulse) & (cur == k)       # clipped to segment k
+                win = win & (k < cap).unsqueeze(1)
+                go = torch.maximum(go, win.float())
+        inp[:, :, 3 * self.n_slots] = go
+
+        # ---- desired trajectory ------------------------------------------------------------
+        # index of the target the hand should hold/reach: cur during the sequence, frozen at
+        # cap-1 on aborts, R-1 during the final hold; start posture before the first pulse
+        # and on trial no-go.
+        didx = torch.minimum(cur, (cap - 1).clamp(min=0).unsqueeze(1)).clamp(max=R - 1)
+        des_x = tx.gather(1, didx)
+        des_y = ty.gather(1, didx)
+        moved = (tg >= t_go) & (cap > 0).unsqueeze(1)                   # (n, T)
+        desired = torch.where(moved.unsqueeze(-1),
+                              torch.stack([des_x, des_y], dim=-1),
+                              start.unsqueeze(1))
+
+        if self.desired_profile == 'min_jerk':
+            # overwrite each cued segment with a min-jerk ramp prev -> target k, then hold
+            for k in range(R):
+                pk = pulse_times[:, k:k + 1]                            # segment start (n, 1)
+                seg_len = (bounds[:, k:k + 1] - pk).clamp(min=1)
+                mj = seg_len.clamp(max=self.mj_move_steps).float()
+                s = _min_jerk_s((tg - pk).float() / mj)                 # (n, T)
+                prev = start if k == 0 else targets[:, k - 1]           # (n, 2)
+                ramp = prev.unsqueeze(1) + (targets[:, k] - prev).unsqueeze(1) * s.unsqueeze(-1)
+                mask = (cur == k) & moved & (k < cap).unsqueeze(1)
+                desired = torch.where(mask.unsqueeze(-1), ramp, desired)
+
+        # per-trial epoch boundaries (step indices); not used in training, handy for analysis
+        timestamps = {
+            'delay_start':   t_delay.squeeze(-1).long(),                # targets appear
+            'move_start':    t_go.squeeze(-1).long(),                   # first go pulse
+            'capture_times': bounds.long(),                             # (n, n_reaches)
+            'final_start':   final_start.long(),                        # last capture
+            'episode_end':   torch.full((n,), T, dtype=torch.long, device=dev),
+            'horizon':       horizon.long(),
+            'is_no_go':      nogo,
+            'no_go_reach':   no_go_reach.long(),
+        }
+        return theta0, inp, desired, perturbation, timestamps
+
+
+TASKS = {'delayed_reach': DelayedReaching, 'delayed_reach_posture': DelayedReachPosture,
+         'horizon_sequence': HorizonSequence}
 
 def make_task(name, effector, **kwargs):
     return TASKS[name](effector, **kwargs)

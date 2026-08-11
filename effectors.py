@@ -72,10 +72,11 @@ class Effector:
     action_names = []
     state_specs = {}
 
-    def __init__(self, dt=0.01, vis_delay_ms=70, pro_delay_ms=25, **kwargs):
+    def __init__(self, dt=0.01, vis_delay_ms=70, pro_delay_ms=25, task_dim=4, **kwargs):
         self.dt = dt
         self.vis_delay_ms = vis_delay_ms
         self.pro_delay_ms = pro_delay_ms
+        self.task_dim = int(task_dim)                 # width of the task/instruction stream
         self.device = torch.device("cpu")
 
     # --- derived ---
@@ -85,10 +86,11 @@ class Effector:
     def pro_d(self): return max(1, round(self.pro_delay_ms / 1000 / self.dt))
     @property
     def input_layout(self):
-        # instruction = [target_x*vis, target_y*vis, target_visible, go]
-        return [('task', 4), ('vision', 2), ('proprio', self.proprio_dim)]
+        # instruction stream width is set by the task (task_dim); e.g. 4 for the single-reach
+        # tasks [target_x*vis, target_y*vis, target_visible, go], 10 for horizon_sequence.
+        return [('task', self.task_dim), ('vision', 2), ('proprio', self.proprio_dim)]
     @property
-    def input_dim(self): return 4 + 2 + self.proprio_dim
+    def input_dim(self): return self.task_dim + 2 + self.proprio_dim
 
     def to(self, device):
         self.device = torch.device(device)
