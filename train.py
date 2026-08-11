@@ -25,7 +25,7 @@ p = argparse.ArgumentParser()
 # --- main / training ---
 p.add_argument("--effector", choices=["point_mass", "arm_torque", "arm26"], default="arm26")
 p.add_argument("--task", choices=["delayed_reach", "delayed_reach_posture", "horizon_sequence",
-                                  "hold_posture_pulse", "hold_posture_ramp"],
+                                  "hold_posture_pulse", "hold_posture_ramp", "pursuit"],
                default="delayed_reach")
 p.add_argument("--desired-profile", choices=["step", "min_jerk"], default="step",
                help="target trajectory the position loss regresses against: 'step' (jump to "
@@ -98,6 +98,18 @@ p.add_argument("--center-frac",    type=float, default=None,
                     "(default 0.4 = central 40%%, keeps the arm clear of its limits)")
 p.add_argument("--catch-prob",     type=float, default=None,
                help="hold tasks: fraction of catch trials with no external bump (default 0.3)")
+# pursuit
+p.add_argument("--duration-ms",     type=int,   default=None, help="pursuit trial length (ms), default 3000")
+p.add_argument("--hold-range-ms",   type=list_of_int, default=None,
+               help="pursuit: pre-motion hold window (ms), default 300,500")
+p.add_argument("--pursuit-speed",   type=float, default=None,
+               help="pursuit: fixed target speed in normalized workspace units/s (default 0.5)")
+p.add_argument("--pursuit-speed-range", type=list_of_float, default=None,
+               help="pursuit: min,max for a smooth time-varying target speed (overrides fixed speed)")
+p.add_argument("--pursuit-turn-tau-ms", type=float, default=None,
+               help="pursuit: heading-smoothness time constant (ms), default 400")
+p.add_argument("--pursuit-curviness", type=float, default=None,
+               help="pursuit: how sharply the path winds (default 1.0)")
 p.add_argument("--go-pulse-ms", type=float, default=150,
                help="go-cue pulse duration (ms): the go input goes to 1 at go onset and back "
                     "to 0 after this long; 0 or negative = sustained cue (old step behaviour)")
@@ -178,6 +190,15 @@ elif args.task in ("hold_posture_pulse", "hold_posture_ramp"):
         if args.ramp_range_ms is not None: hk['ramp_range_ms'] = tuple(args.ramp_range_ms)
         if args.hold_after_ramp:          hk['hold_after_ramp'] = True
     task = make_task(args.task, eff, **hk)
+elif args.task == "pursuit":
+    pk = {'unified_input': args.unified_input}
+    if args.duration_ms          is not None: pk['duration_ms']   = args.duration_ms
+    if args.hold_range_ms        is not None: pk['hold_range_ms'] = tuple(args.hold_range_ms)
+    if args.pursuit_speed        is not None: pk['speed']         = args.pursuit_speed
+    if args.pursuit_speed_range  is not None: pk['speed_range']   = tuple(args.pursuit_speed_range)
+    if args.pursuit_turn_tau_ms  is not None: pk['turn_tau_ms']   = args.pursuit_turn_tau_ms
+    if args.pursuit_curviness    is not None: pk['curviness']     = args.pursuit_curviness
+    task = make_task(args.task, eff, **pk)
 elif args.task == "horizon_sequence":
     sk = {'desired_profile': args.desired_profile, **perturb_kw}
     if args.n_reaches        is not None: sk['n_reaches']        = args.n_reaches
@@ -191,10 +212,11 @@ elif args.task == "horizon_sequence":
     task = make_task(args.task, eff, **sk)
 else:
     raise ValueError(f"Invalid task: {args.task}")
-if args.task == "horizon_sequence" and args.w_loss_urgency > 0:
-    print("WARNING: --w-loss-urgency penalizes distance to the FINAL target after the first go, "
-          "which is wrong for a reach sequence (it fights dwelling at intermediate targets); "
-          "consider leaving it at 0 for horizon_sequence.")
+URGENCY_TASKS = {"delayed_reach", "delayed_reach_posture"}          # single final target after a go
+if args.task not in URGENCY_TASKS and args.w_loss_urgency > 0:
+    print(f"WARNING: --w-loss-urgency penalizes distance to the FINAL target after the go cue, "
+          f"which is only meaningful for a single-reach-to-a-fixed-target task. It is ignored "
+          f"for task {args.task!r} (a moving/sequenced/held target has no single final target).")
 print(f"effector: {eff.name}  (input_dim={eff.input_dim}, output_dim={eff.output_dim}, "
       f"vis_d={eff.vis_d}, pro_d={eff.pro_d})")
 print(f"task: {task.name}  (episode {task.steps} steps = {task.steps * args.dt:.2f} s)")
@@ -248,17 +270,22 @@ torch.manual_seed(args.seed)
 def hold_mask_from_ts(ts, T, device):
     """(batch, T) bool mask that is True during the start hold (before go) and the final hold.
 
-    Uses the per-trial epoch boundaries returned by the task. Works for both tasks:
-      - delayed_reach_posture: start hold = t < move_start, final hold = t >= final_start
-      - delayed_reach:         start hold = t < go_start  (no explicit final-hold epoch)
+    Uses the per-trial epoch boundaries returned by the task:
+      - hold_posture_*:        whole episode is a hold
+      - delayed_reach_posture / horizon_sequence: start hold = t < move_start, final hold = t >= final_start
+      - pursuit:               start hold = t < move_start (no final hold; it tracks afterwards)
+      - delayed_reach:         start hold = t < go_start   (no explicit final-hold epoch)
     """
     n = ts['episode_end'].shape[0]
     tg = torch.arange(T, device=device).unsqueeze(0)                    # (1, T)
     if 'bump_onset' in ts:                                             # hold_posture_* : hold all episode
         return torch.ones(n, T, dtype=torch.bool, device=device)
-    if 'move_start' in ts:                                              # delayed_reach_posture / horizon_sequence
+    if 'move_start' in ts:                                              # posture / sequence / pursuit
         start_hold = tg < ts['move_start'].to(device).unsqueeze(1)
-        end_hold   = tg >= ts['final_start'].to(device).unsqueeze(1)
+        if 'final_start' in ts:                                        # posture / sequence have a final hold
+            end_hold = tg >= ts['final_start'].to(device).unsqueeze(1)
+        else:                                                          # pursuit: no final hold
+            end_hold = torch.zeros_like(start_hold)
     else:                                                               # delayed_reach
         start_hold = tg < ts['go_start'].to(device).unsqueeze(1)
         end_hold   = torch.zeros_like(start_hold)
@@ -308,7 +335,7 @@ for i in tqdm(range(args.n_batch)):
     #     small tau forces a fast, early-peaking reach even in a long window. off when weight 0.
     dev = states.pos.device
     go_key = 'move_start' if 'move_start' in ts else ('go_start' if 'go_start' in ts else None)
-    if go_key is None:                                                                # hold tasks: no go cue
+    if args.task not in URGENCY_TASKS or go_key is None:                              # no single final target
         loss_urgency = torch.zeros((), device=dev)
     else:
         go_step = ts[go_key].to(dev)                                                  # (n,)

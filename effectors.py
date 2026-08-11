@@ -108,6 +108,13 @@ class Effector:
         sample_joint (subclasses that know their range narrow it around the midpoint)."""
         return self.sample_joint(n)
 
+    @property
+    def config_range(self):
+        """(lo, hi) tensors of shape (dof,): the per-DoF sampling range of the 'joint' space
+        (xy for the point mass, shoulder/elbow angles for the arms). Used to normalize the
+        pursuit target generator to a [0,1]^dof box. Provided by subclasses."""
+        raise NotImplementedError
+
     # --- to be provided by subclasses ---
     def sample_joint(self, n): raise NotImplementedError
     def joint_to_cart(self, theta): raise NotImplementedError
@@ -212,6 +219,12 @@ class PointMass(Effector):
         mid, half = 0.5 * (lo + hi), 0.5 * (hi - lo) * frac
         return torch.rand(n, 2, device=self.device) * (2 * half) + (mid - half)
 
+    @property
+    def config_range(self):
+        lo, hi = self.pos_range
+        return (torch.tensor([lo, lo], device=self.device),
+                torch.tensor([hi, hi], device=self.device))
+
     def joint_to_cart(self, theta):
         return theta                                  # the "joint" IS the cartesian position
 
@@ -269,6 +282,11 @@ class TwoJointArm(Effector):
             mid, half = 0.5 * (rng[0] + rng[1]), 0.5 * (rng[1] - rng[0]) * frac
             return torch.rand(n, 1, device=self.device) * (2 * half) + (mid - half)
         return torch.cat([ctr(self.sho_range), ctr(self.elb_range)], dim=1)
+
+    @property
+    def config_range(self):
+        return (torch.tensor([self.sho_range[0], self.elb_range[0]], device=self.device),
+                torch.tensor([self.sho_range[1], self.elb_range[1]], device=self.device))
 
     def cartesian_force_to_perturbation(self, theta0, force_xy):
         return arm_jacobian_T_force(theta0, force_xy)          # J^T F -> joint torque
@@ -346,6 +364,11 @@ class Arm26(Effector):
             mid, half = 0.5 * (rng[0] + rng[1]), 0.5 * (rng[1] - rng[0]) * frac
             return torch.rand(n, 1, device=self.device) * (2 * half) + (mid - half)
         return torch.cat([ctr(self.sho_range), ctr(self.elb_range)], dim=1)
+
+    @property
+    def config_range(self):
+        return (torch.tensor([self.sho_range[0], self.elb_range[0]], device=self.device),
+                torch.tensor([self.sho_range[1], self.elb_range[1]], device=self.device))
 
     def cartesian_force_to_perturbation(self, theta0, force_xy):
         return arm_jacobian_T_force(theta0, force_xy)          # J^T F -> joint torque

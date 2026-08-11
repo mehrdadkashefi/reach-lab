@@ -118,6 +118,15 @@ def build_task(cfg, effector):
         if cfg.get("prob_no_go")       is not None: kw["prob_no_go"]       = cfg["prob_no_go"]
         if cfg.get("prob_no_go_reach") is not None: kw["prob_no_go_reach"] = cfg["prob_no_go_reach"]
         return make_task(name, effector, **kw)
+    elif name == "pursuit":
+        kw = {"unified_input": unified}
+        if cfg.get("duration_ms")         is not None: kw["duration_ms"]   = cfg["duration_ms"]
+        if cfg.get("hold_range_ms")       is not None: kw["hold_range_ms"] = tuple(cfg["hold_range_ms"])
+        if cfg.get("pursuit_speed")       is not None: kw["speed"]         = cfg["pursuit_speed"]
+        if cfg.get("pursuit_speed_range") is not None: kw["speed_range"]   = tuple(cfg["pursuit_speed_range"])
+        if cfg.get("pursuit_turn_tau_ms") is not None: kw["turn_tau_ms"]   = cfg["pursuit_turn_tau_ms"]
+        if cfg.get("pursuit_curviness")   is not None: kw["curviness"]     = cfg["pursuit_curviness"]
+        return make_task(name, effector, **kw)
     raise ValueError(f"unknown task in config: {name!r}")
 
 
@@ -159,6 +168,8 @@ def _apply_task_timing(cfg, spec):
         spec.setdefault("init_steps", 40);  spec.setdefault("delay_steps", 50)
         spec.setdefault("dwell_steps", 50); spec.setdefault("final_steps", 40)
     elif cfg.get("task") in ("hold_posture_pulse", "hold_posture_ramp"):
+        pass                                                    # timing sampled by the task itself
+    elif cfg.get("task") == "pursuit":
         pass                                                    # timing sampled by the task itself
     else:                                                        # delayed_reach_posture
         spec.setdefault("init_steps", 40);  spec.setdefault("delay_steps", 50)
@@ -266,8 +277,26 @@ def spec_hold(cfg, effector, n_dirs=8):
     return _apply_task_timing(cfg, spec)
 
 
+def spec_pursuit(cfg, effector, n_trials=6):
+    """A handful of pursuit trials from the workspace-center posture (distinct random paths per
+    trial, reproducible via the harness seed). Only applies to the pursuit task."""
+    if cfg.get("task") != "pursuit":
+        return None
+    if effector.name == "point_mass":
+        lo, hi = effector.pos_range
+        center = [0.5 * (lo + hi)] * 2
+        start_space = "cartesian"
+    else:
+        sho = 0.5 * (effector.sho_range[0] + effector.sho_range[1])
+        elb = 0.5 * (effector.elb_range[0] + effector.elb_range[1])
+        center = [sho, elb]
+        start_space = "joint"
+    spec = {"start_space": start_space, "start": [center] * n_trials}
+    return _apply_task_timing(cfg, spec)
+
+
 BUILTIN_SPECS = {"center_out": spec_center_out, "point2point": spec_point2point,
-                 "sequence": spec_sequence, "hold": spec_hold}
+                 "sequence": spec_sequence, "hold": spec_hold, "pursuit": spec_pursuit}
 
 
 # ----------------------------------------------------------------------------- run one folder
@@ -340,7 +369,7 @@ def main():
     ap.add_argument("--spec", action="append", default=None,
                     help="path to a user JSON spec; repeatable. Each is named by its filename "
                          "and run in addition to the built-in specs.")
-    ap.add_argument("--builtin", default="center_out,point2point,sequence,hold",
+    ap.add_argument("--builtin", default="center_out,point2point,sequence,hold,pursuit",
                     help="comma-separated built-in specs to run "
                          f"(choices: {', '.join(BUILTIN_SPECS)}; pass 'none' to skip them)")
     ap.add_argument("--device", default="cpu")

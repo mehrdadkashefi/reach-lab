@@ -846,10 +846,206 @@ class HoldPostureRamp(_HoldPostureBase):
             active = active & (tg < onset + ramp)                       # release after the ramp
         return active.float() * frac * amp
 
+# Random Pursuit
+def _wrap_angle(a):
+    """Wrap angle(s) to (-pi, pi]."""
+    return torch.atan2(torch.sin(a), torch.cos(a))
+
+
+def smooth_random_pursuit(n, T, dt, device, q0, move_onset,
+                          speed=0.5, speed_range=None,
+                          turn_tau_ms=400.0, speed_tau_ms=800.0,
+                          curviness=1.0, margin=0.12, wall_gain=8.0,
+                          generator=None):
+    """Generate n smooth, workspace-spanning random trajectories in a normalized [0,1]^2 box.
+
+    The target moves at a controlled speed in a heading that turns smoothly over time, so the
+    path is continuous and never stops once it starts. Speed is either fixed (`speed`, in box
+    units per second) or itself a smooth random signal within `speed_range=(min,max)`. Heading
+    turns follow a smooth (Ornstein-Uhlenbeck) angular-velocity process with time constant
+    `turn_tau_ms`; `curviness` scales how sharply it winds. Near a wall (within `margin`) the
+    heading is steered smoothly inward and the speed is smoothly braked to zero, so the target
+    decelerates, turns, and re-accelerates without ever leaving the box (no hard clamp -> no kink
+    in the path). Before each trial's `move_onset` step the target holds at its start `q0`.
+
+    Args:
+        q0:         (n, 2) start position in [0,1]^2 (normalized config space).
+        move_onset: (n,) step at which each trial's motion begins.
+    Returns:
+        q: (n, T, 2) normalized positions in [0,1]^2 (smooth; q[:, t] == q0 for t < move_onset).
+    """
+    assert q0.shape[1] == 2, "pursuit generator supports dof=2 effectors"
+    randn = (lambda *s: torch.randn(*s, device=device, generator=generator))
+    rand = (lambda *s: torch.rand(*s, device=device, generator=generator))
+
+    turn_tau = max(dt, turn_tau_ms / 1000.0)
+    a_turn = float(np.exp(-dt / turn_tau))
+    omega_std = curviness / turn_tau                                  # rad/s angular-velocity std
+    b_turn = float(np.sqrt(max(1e-8, 1.0 - a_turn ** 2))) * omega_std
+
+    varying = speed_range is not None
+    if varying:
+        smin, smax = float(speed_range[0]), float(speed_range[1])
+        s_mid = 0.5 * (smin + smax)
+        speed_tau = max(dt, speed_tau_ms / 1000.0)
+        a_s = float(np.exp(-dt / speed_tau))
+        sigma_s = (smax - smin) * 0.35                               # per-sqrt(s) drive
+        s = rand(n) * (smax - smin) + smin
+    else:
+        s = torch.full((n,), float(speed), device=device)
+
+    q = q0.clone()
+    phi = rand(n) * (2 * np.pi)                                       # heading
+    omega = torch.zeros(n, device=device)
+    onset = move_onset.to(device)
+
+    def _smoothstep(x):
+        x = x.clamp(0.0, 1.0)
+        return x * x * (3.0 - 2.0 * x)
+
+    out = torch.empty(n, T, 2, device=device)
+    with torch.no_grad():
+        for t in range(T):
+            out[:, t] = q
+            moving = (t >= onset).float()                            # (n,)
+
+            omega = a_turn * omega + b_turn * randn(n)               # smooth angular velocity
+
+            # soft wall steering: inward push grows within `margin` of a wall; rotate heading
+            # toward that inward direction (rotation only -- does not change speed).
+            inward = (margin - q).clamp(min=0) - (q - (1.0 - margin)).clamp(min=0)   # (n, 2)
+            wall_mag = inward.norm(dim=1)
+            phi_in = torch.atan2(inward[:, 1], inward[:, 0])
+            steer = wall_gain * wall_mag * _wrap_angle(phi_in - phi)
+            phi = phi + (omega + steer) * dt * moving
+
+            if varying:
+                s = a_s * s + (1 - a_s) * s_mid + sigma_s * float(np.sqrt(dt)) * randn(n)
+                s = s.clamp(smin, smax)
+
+            dir_xy = torch.stack([torch.cos(phi), torch.sin(phi)], dim=1)            # (n, 2) unit
+            # smooth per-axis wall brake: damp only the velocity component heading into a wall
+            # (within `margin` of it), so the target curves along the wall at speed instead of
+            # stalling, and never leaves [0,1]. Smoothstep keeps it C1-smooth.
+            ahead = torch.where(dir_xy >= 0, 1.0 - q, q)            # (n, 2) dist to approaching wall
+            brake = _smoothstep(ahead / margin)                    # (n, 2) per-axis, 1 interior, 0 at wall
+            v = s.unsqueeze(1) * dir_xy * brake
+            q = q + v * dt * moving.unsqueeze(1)
+            q = q.clamp(0.0, 1.0)                                    # ultimate safety (should be inactive)
+    return out
+
+
+class PursuitTask:
+    """Continuous random-pursuit tracking. The hand starts on the target at a central posture;
+    after a short hold (hold_range_ms) the target begins to move smoothly and randomly across
+    the workspace and the hand must track it as accurately as possible for the rest of the trial.
+
+    The target motion is generated by smooth_random_pursuit in normalized config space (so every
+    target point is reachable), then mapped to Cartesian for the instruction / desired. Speed is
+    fixed (speed) or a smooth random signal (speed_range); heading turns smoothly. There is no go
+    cue -- the target is simply visible throughout and the network tracks it visually.
+    """
+    name = "pursuit"
+    input_channels = 4                    # [target_x, target_y, target_visible, go(unused=0)]
+    supports_unified = True
+
+    def __init__(self, effector, duration_ms=3000, hold_range_ms=(300, 500),
+                 speed=0.5, speed_range=None, turn_tau_ms=400.0, speed_tau_ms=800.0,
+                 curviness=1.0, center_frac=0.5, unified_input=False,
+                 desired_profile='step', **kwargs):
+        self.effector = effector
+        self.unified_input = bool(unified_input)
+        self.center_frac = float(center_frac)
+        self.speed = float(speed)
+        self.speed_range = None if speed_range is None else (float(speed_range[0]), float(speed_range[1]))
+        self.turn_tau_ms = float(turn_tau_ms)
+        self.speed_tau_ms = float(speed_tau_ms)
+        self.curviness = float(curviness)
+        ms2steps = lambda ms: max(1, round(ms / 1000 / effector.dt))
+        self.hold_lo, self.hold_hi = ms2steps(hold_range_ms[0]), ms2steps(hold_range_ms[1])
+        self.steps = ms2steps(duration_ms)
+
+    def _targets_from_norm(self, q_norm):
+        """Map normalized (n, T, 2) config-box coords to (theta0, target_xy (n, T, 2))."""
+        lo, hi = self.effector.config_range
+        lo = lo.view(1, 1, 2); hi = hi.view(1, 1, 2)
+        q_cfg = lo + q_norm * (hi - lo)                             # (n, T, 2) config space
+        n, T, _ = q_cfg.shape
+        xy = self.effector.joint_to_cart(q_cfg.reshape(n * T, 2)).reshape(n, T, 2)
+        return q_cfg, xy
+
+    def make_batch(self, n=None, spec=None):
+        """Random batch when spec is None (training), or an explicit batch from a spec dict.
+
+        spec keys (all optional):
+            start / start_space      : start posture ((dof,) or (n, dof)); default = central sample
+            speed                    : fixed target speed (box units/s)
+            speed_range              : (min, max) for smooth time-varying speed (overrides speed)
+            hold_steps               : steps before motion onset (default: hold range midpoint)
+            duration_steps / steps   : episode length (default: self.steps)
+            curviness / turn_tau_ms  : path winding controls
+        """
+        eff, dev = self.effector, self.effector.device
+        lo, hi = eff.config_range
+        lo2, hi2 = lo.view(1, 2), hi.view(1, 2)
+
+        if spec is None:
+            if n is None:
+                raise ValueError("make_batch needs either n (random) or spec (explicit)")
+            theta0 = eff.sample_center_joint(n, self.center_frac)
+            T = self.steps
+            onset = torch.randint(self.hold_lo, self.hold_hi + 1, (n,), device=dev)
+            speed, speed_range = self.speed, self.speed_range
+            curviness, turn_tau = self.curviness, self.turn_tau_ms
+            gen = None
+        else:
+            start = spec.get("start")
+            if start is None:
+                theta0 = eff.sample_center_joint(int(spec.get("n", 1)), self.center_frac)
+            else:
+                start = torch.as_tensor(np.asarray(start, dtype=np.float32), device=dev)
+                if start.ndim == 1:
+                    start = start.unsqueeze(0)
+                theta0 = (eff.cartesian_to_joint(start)
+                          if spec.get("start_space", "joint") == "cartesian" else start)
+            n = theta0.shape[0]
+            T = int(spec.get("duration_steps", spec.get("steps", self.steps)))
+            onset = _as_col(spec.get("hold_steps", (self.hold_lo + self.hold_hi) // 2),
+                            n, dev).squeeze(1)
+            speed = float(spec.get("speed", self.speed))
+            speed_range = spec.get("speed_range", self.speed_range)
+            curviness = float(spec.get("curviness", self.curviness))
+            turn_tau = float(spec.get("turn_tau_ms", self.turn_tau_ms))
+
+        # normalized start q0 in [0,1]^2 from theta0, then generate the smooth random path
+        q0 = ((theta0 - lo2) / (hi2 - lo2)).clamp(0.0, 1.0)
+        q_norm = smooth_random_pursuit(n, T, eff.dt, dev, q0, onset,
+                                       speed=speed, speed_range=speed_range,
+                                       turn_tau_ms=turn_tau, speed_tau_ms=self.speed_tau_ms,
+                                       curviness=curviness, generator=gen if spec is None else None)
+        _, target_xy = self._targets_from_norm(q_norm)               # (n, T, 2) cartesian
+
+        # instruction stream: the (moving) target, always visible, no go cue
+        inp = torch.zeros(n, T, 4, device=dev)
+        inp[:, :, 0:2] = target_xy
+        inp[:, :, 2]   = 1.0
+        if self.unified_input:
+            inp = _pack_unified(inp)
+
+        desired = target_xy                                          # track the target
+        perturbation = None
+
+        timestamps = {
+            'move_start':  onset.long(),                             # motion onset (= hold end)
+            'episode_end': torch.full((n,), T, dtype=torch.long, device=dev),
+        }
+        return theta0, inp, desired, perturbation, timestamps
+
 
 TASKS = {'delayed_reach': DelayedReaching, 'delayed_reach_posture': DelayedReachPosture,
          'horizon_sequence': HorizonSequence,
-         'hold_posture_pulse': HoldPosturePulse, 'hold_posture_ramp': HoldPostureRamp}
+         'hold_posture_pulse': HoldPosturePulse, 'hold_posture_ramp': HoldPostureRamp,
+         'pursuit': PursuitTask}
 
 
 def task_input_channels(name, unified_input=False):
