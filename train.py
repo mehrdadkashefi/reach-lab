@@ -25,7 +25,8 @@ p = argparse.ArgumentParser()
 # --- main / training ---
 p.add_argument("--effector", choices=["point_mass", "arm_torque", "arm26"], default="arm26")
 p.add_argument("--task", choices=["delayed_reach", "delayed_reach_posture", "horizon_sequence",
-                                  "hold_posture_pulse", "hold_posture_ramp", "pursuit"],
+                                  "hold_posture_pulse", "hold_posture_ramp", "pursuit",
+                                  "pursuit_horizon"],
                default="delayed_reach")
 p.add_argument("--desired-profile", choices=["step", "min_jerk"], default="step",
                help="target trajectory the position loss regresses against: 'step' (jump to "
@@ -110,6 +111,11 @@ p.add_argument("--pursuit-turn-tau-ms", type=float, default=None,
                help="pursuit: heading-smoothness time constant (ms), default 400")
 p.add_argument("--pursuit-curviness", type=float, default=None,
                help="pursuit: how sharply the path winds (default 1.0)")
+p.add_argument("--pursuit-horizon-probs", type=list_of_float, default=None,
+               help="pursuit_horizon: P(H1),P(H2),P(H3); e.g. 1,0,0 = H1 only, "
+                    "0.333,0.333,0.334 = equal mix (default uniform)")
+p.add_argument("--pursuit-horizon-offsets-ms", type=list_of_float, default=None,
+               help="pursuit_horizon: look-ahead offsets for the 3 slots (ms), default 0,100,200")
 p.add_argument("--go-pulse-ms", type=float, default=150,
                help="go-cue pulse duration (ms): the go input goes to 1 at go onset and back "
                     "to 0 after this long; 0 or negative = sustained cue (old step behaviour)")
@@ -190,7 +196,7 @@ elif args.task in ("hold_posture_pulse", "hold_posture_ramp"):
         if args.ramp_range_ms is not None: hk['ramp_range_ms'] = tuple(args.ramp_range_ms)
         if args.hold_after_ramp:          hk['hold_after_ramp'] = True
     task = make_task(args.task, eff, **hk)
-elif args.task == "pursuit":
+elif args.task in ("pursuit", "pursuit_horizon"):
     pk = {'unified_input': args.unified_input}
     if args.duration_ms          is not None: pk['duration_ms']   = args.duration_ms
     if args.hold_range_ms        is not None: pk['hold_range_ms'] = tuple(args.hold_range_ms)
@@ -198,6 +204,9 @@ elif args.task == "pursuit":
     if args.pursuit_speed_range  is not None: pk['speed_range']   = tuple(args.pursuit_speed_range)
     if args.pursuit_turn_tau_ms  is not None: pk['turn_tau_ms']   = args.pursuit_turn_tau_ms
     if args.pursuit_curviness    is not None: pk['curviness']     = args.pursuit_curviness
+    if args.task == "pursuit_horizon":
+        if args.pursuit_horizon_probs      is not None: pk['horizon_probs']      = tuple(args.pursuit_horizon_probs)
+        if args.pursuit_horizon_offsets_ms is not None: pk['horizon_offsets_ms'] = tuple(args.pursuit_horizon_offsets_ms)
     task = make_task(args.task, eff, **pk)
 elif args.task == "horizon_sequence":
     sk = {'desired_profile': args.desired_profile, **perturb_kw}

@@ -118,7 +118,7 @@ def build_task(cfg, effector):
         if cfg.get("prob_no_go")       is not None: kw["prob_no_go"]       = cfg["prob_no_go"]
         if cfg.get("prob_no_go_reach") is not None: kw["prob_no_go_reach"] = cfg["prob_no_go_reach"]
         return make_task(name, effector, **kw)
-    elif name == "pursuit":
+    elif name in ("pursuit", "pursuit_horizon"):
         kw = {"unified_input": unified}
         if cfg.get("duration_ms")         is not None: kw["duration_ms"]   = cfg["duration_ms"]
         if cfg.get("hold_range_ms")       is not None: kw["hold_range_ms"] = tuple(cfg["hold_range_ms"])
@@ -126,6 +126,9 @@ def build_task(cfg, effector):
         if cfg.get("pursuit_speed_range") is not None: kw["speed_range"]   = tuple(cfg["pursuit_speed_range"])
         if cfg.get("pursuit_turn_tau_ms") is not None: kw["turn_tau_ms"]   = cfg["pursuit_turn_tau_ms"]
         if cfg.get("pursuit_curviness")   is not None: kw["curviness"]     = cfg["pursuit_curviness"]
+        if name == "pursuit_horizon":
+            if cfg.get("pursuit_horizon_probs")      is not None: kw["horizon_probs"]      = tuple(cfg["pursuit_horizon_probs"])
+            if cfg.get("pursuit_horizon_offsets_ms") is not None: kw["horizon_offsets_ms"] = tuple(cfg["pursuit_horizon_offsets_ms"])
         return make_task(name, effector, **kw)
     raise ValueError(f"unknown task in config: {name!r}")
 
@@ -169,7 +172,7 @@ def _apply_task_timing(cfg, spec):
         spec.setdefault("dwell_steps", 50); spec.setdefault("final_steps", 40)
     elif cfg.get("task") in ("hold_posture_pulse", "hold_posture_ramp"):
         pass                                                    # timing sampled by the task itself
-    elif cfg.get("task") == "pursuit":
+    elif cfg.get("task") in ("pursuit", "pursuit_horizon"):
         pass                                                    # timing sampled by the task itself
     else:                                                        # delayed_reach_posture
         spec.setdefault("init_steps", 40);  spec.setdefault("delay_steps", 50)
@@ -279,8 +282,10 @@ def spec_hold(cfg, effector, n_dirs=8):
 
 def spec_pursuit(cfg, effector, n_trials=6):
     """A handful of pursuit trials from the workspace-center posture (distinct random paths per
-    trial, reproducible via the harness seed). Only applies to the pursuit task."""
-    if cfg.get("task") != "pursuit":
+    trial, reproducible via the harness seed). For pursuit_horizon the trials sweep H1/H2/H3 so
+    the horizons can be compared on comparable paths. Applies to pursuit and pursuit_horizon."""
+    task = cfg.get("task")
+    if task not in ("pursuit", "pursuit_horizon"):
         return None
     if effector.name == "point_mass":
         lo, hi = effector.pos_range
@@ -292,6 +297,8 @@ def spec_pursuit(cfg, effector, n_trials=6):
         center = [sho, elb]
         start_space = "joint"
     spec = {"start_space": start_space, "start": [center] * n_trials}
+    if task == "pursuit_horizon":
+        spec["horizon"] = [(i % 3) + 1 for i in range(n_trials)]     # cycle H1, H2, H3
     return _apply_task_timing(cfg, spec)
 
 

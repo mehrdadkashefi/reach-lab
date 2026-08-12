@@ -846,7 +846,7 @@ class HoldPostureRamp(_HoldPostureBase):
             active = active & (tg < onset + ramp)                       # release after the ramp
         return active.float() * frac * amp
 
-# Random Pursuit
+
 def _wrap_angle(a):
     """Wrap angle(s) to (-pi, pi]."""
     return torch.atan2(torch.sin(a), torch.cos(a))
@@ -974,17 +974,9 @@ class PursuitTask:
         xy = self.effector.joint_to_cart(q_cfg.reshape(n * T, 2)).reshape(n, T, 2)
         return q_cfg, xy
 
-    def make_batch(self, n=None, spec=None):
-        """Random batch when spec is None (training), or an explicit batch from a spec dict.
-
-        spec keys (all optional):
-            start / start_space      : start posture ((dof,) or (n, dof)); default = central sample
-            speed                    : fixed target speed (box units/s)
-            speed_range              : (min, max) for smooth time-varying speed (overrides speed)
-            hold_steps               : steps before motion onset (default: hold range midpoint)
-            duration_steps / steps   : episode length (default: self.steps)
-            curviness / turn_tau_ms  : path winding controls
-        """
+    def _generate(self, n, spec):
+        """Shared target generation for pursuit and its horizon variant. Returns
+        (theta0 (n, dof), target_xy (n, T, 2) cartesian, onset (n,), T)."""
         eff, dev = self.effector, self.effector.device
         lo, hi = eff.config_range
         lo2, hi2 = lo.view(1, 2), hi.view(1, 2)
@@ -1016,14 +1008,30 @@ class PursuitTask:
             speed_range = spec.get("speed_range", self.speed_range)
             curviness = float(spec.get("curviness", self.curviness))
             turn_tau = float(spec.get("turn_tau_ms", self.turn_tau_ms))
+            gen = None
 
-        # normalized start q0 in [0,1]^2 from theta0, then generate the smooth random path
         q0 = ((theta0 - lo2) / (hi2 - lo2)).clamp(0.0, 1.0)
         q_norm = smooth_random_pursuit(n, T, eff.dt, dev, q0, onset,
                                        speed=speed, speed_range=speed_range,
                                        turn_tau_ms=turn_tau, speed_tau_ms=self.speed_tau_ms,
-                                       curviness=curviness, generator=gen if spec is None else None)
+                                       curviness=curviness, generator=gen)
         _, target_xy = self._targets_from_norm(q_norm)               # (n, T, 2) cartesian
+        return theta0, target_xy, onset.long(), T
+
+    def make_batch(self, n=None, spec=None):
+        """Random batch when spec is None (training), or an explicit batch from a spec dict.
+
+        spec keys (all optional):
+            start / start_space      : start posture ((dof,) or (n, dof)); default = central sample
+            speed                    : fixed target speed (box units/s)
+            speed_range              : (min, max) for smooth time-varying speed (overrides speed)
+            hold_steps               : steps before motion onset (default: hold range midpoint)
+            duration_steps / steps   : episode length (default: self.steps)
+            curviness / turn_tau_ms  : path winding controls
+        """
+        dev = self.effector.device
+        theta0, target_xy, onset, T = self._generate(n, spec)
+        n = theta0.shape[0]
 
         # instruction stream: the (moving) target, always visible, no go cue
         inp = torch.zeros(n, T, 4, device=dev)
@@ -1036,8 +1044,71 @@ class PursuitTask:
         perturbation = None
 
         timestamps = {
-            'move_start':  onset.long(),                             # motion onset (= hold end)
+            'move_start':  onset,                                    # motion onset (= hold end)
             'episode_end': torch.full((n,), T, dtype=torch.long, device=dev),
+        }
+        return theta0, inp, desired, perturbation, timestamps
+
+
+class PursuitHorizon(PursuitTask):
+    """Random pursuit with a limited look-ahead horizon. The instruction stream shows the target
+    at up to n_slots future offsets (default: now, +100 ms, +200 ms) in the 3 target slots of the
+    unified layout. The per-trial horizon h in {1..3} (drawn from horizon_probs) sets how many
+    slots are lit: h=1 shows only the current target, h=2 adds the +100 ms preview, h=3 adds the
+    +200 ms preview. The desired (tracked) target is always the current one (slot 0); the previews
+    are extra information the controller can use to reduce tracking lag. Training on a mixture of
+    horizons is set by horizon_probs, e.g. (1, 0, 0) = H1 only, (1/3, 1/3, 1/3) = equal mix.
+
+    Layout is always the 10-wide unified stream (3 slots x [x, y, on] + go); go is unused (0).
+    """
+    name = "pursuit_horizon"
+    n_slots = 3
+    input_channels = 3 * n_slots + 1      # 10, always
+    supports_unified = False              # already the unified 10-wide layout
+
+    def __init__(self, effector, horizon_probs=(1/3, 1/3, 1/3),
+                 horizon_offsets_ms=(0.0, 100.0, 200.0), **kwargs):
+        kwargs.pop('unified_input', None)                            # always 10-wide; ignore the switch
+        super().__init__(effector, unified_input=False, **kwargs)
+        hp = torch.as_tensor(horizon_probs, dtype=torch.float32)
+        assert hp.numel() == self.n_slots and abs(hp.sum().item() - 1.0) < 1e-4, \
+            f"horizon_probs must be {self.n_slots} probabilities summing to 1"
+        self.horizon_probs = hp
+        assert len(horizon_offsets_ms) == self.n_slots
+        self.offset_steps = [max(0, round(o / 1000 / effector.dt)) for o in horizon_offsets_ms]
+
+    def make_batch(self, n=None, spec=None):
+        """As PursuitTask, plus:
+            horizon : per-trial look-ahead 1..n_slots (default: sampled from horizon_probs);
+                      scalar or length-n in a spec.
+        """
+        dev = self.effector.device
+        theta0, target_xy, onset, T = self._generate(n, spec)
+        n = theta0.shape[0]
+
+        if spec is None or spec.get("horizon") is None:
+            horizon = torch.multinomial(self.horizon_probs.to(dev), n, replacement=True) + 1
+        else:
+            horizon = _as_col(spec["horizon"], n, dev).squeeze(1).clamp(1, self.n_slots)
+
+        # each slot j shows the target at time t + offset_steps[j] (clamped at the trial end),
+        # lit only when the trial's horizon reaches that slot.
+        tg = torch.arange(T, device=dev)
+        inp = torch.zeros(n, T, self.input_channels, device=dev)
+        for j in range(self.n_slots):
+            idx = (tg + self.offset_steps[j]).clamp(max=T - 1)       # (T,) future time index
+            future = target_xy[:, idx, :]                           # (n, T, 2)
+            on = (j < horizon).float().unsqueeze(1)                 # (n, 1) -> broadcast over T
+            inp[:, :, 3 * j:3 * j + 2] = future * on.unsqueeze(-1)
+            inp[:, :, 3 * j + 2] = on
+        # go channel (index 9) stays 0 -- pursuit has no go cue
+
+        desired = target_xy                                          # track the current target
+        perturbation = None
+        timestamps = {
+            'move_start':  onset,
+            'episode_end': torch.full((n,), T, dtype=torch.long, device=dev),
+            'horizon':     horizon.long(),
         }
         return theta0, inp, desired, perturbation, timestamps
 
@@ -1045,7 +1116,7 @@ class PursuitTask:
 TASKS = {'delayed_reach': DelayedReaching, 'delayed_reach_posture': DelayedReachPosture,
          'horizon_sequence': HorizonSequence,
          'hold_posture_pulse': HoldPosturePulse, 'hold_posture_ramp': HoldPostureRamp,
-         'pursuit': PursuitTask}
+         'pursuit': PursuitTask, 'pursuit_horizon': PursuitHorizon}
 
 
 def task_input_channels(name, unified_input=False):
