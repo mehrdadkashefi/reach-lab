@@ -26,7 +26,7 @@ p = argparse.ArgumentParser()
 p.add_argument("--effector", choices=["point_mass", "arm_torque", "arm26"], default="arm26")
 p.add_argument("--task", choices=["delayed_reach", "delayed_reach_posture", "horizon_sequence",
                                   "hold_posture_pulse", "hold_posture_ramp", "pursuit",
-                                  "pursuit_horizon"],
+                                  "pacman"],
                default="delayed_reach")
 p.add_argument("--desired-profile", choices=["step", "min_jerk"], default="step",
                help="target trajectory the position loss regresses against: 'step' (jump to "
@@ -99,10 +99,7 @@ p.add_argument("--center-frac",    type=float, default=None,
                     "(default 0.4 = central 40%%, keeps the arm clear of its limits)")
 p.add_argument("--catch-prob",     type=float, default=None,
                help="hold tasks: fraction of catch trials with no external bump (default 0.3)")
-# pursuit
-p.add_argument("--duration-ms",     type=int,   default=None, help="pursuit trial length (ms), default 3000")
-p.add_argument("--hold-range-ms",   type=list_of_int, default=None,
-               help="pursuit: pre-motion hold window (ms), default 300,500")
+# pursuit (rolling preview + go cue, sharing --exec-ms / --preview-ms / --prob-catch / --go-pulse-ms with pacman)
 p.add_argument("--pursuit-speed",   type=float, default=None,
                help="pursuit: fixed target speed in normalized workspace units/s (default 0.5)")
 p.add_argument("--pursuit-speed-range", type=list_of_float, default=None,
@@ -111,11 +108,15 @@ p.add_argument("--pursuit-turn-tau-ms", type=float, default=None,
                help="pursuit: heading-smoothness time constant (ms), default 400")
 p.add_argument("--pursuit-curviness", type=float, default=None,
                help="pursuit: how sharply the path winds (default 1.0)")
-p.add_argument("--pursuit-horizon-probs", type=list_of_float, default=None,
-               help="pursuit_horizon: P(H1),P(H2),P(H3); e.g. 1,0,0 = H1 only, "
-                    "0.333,0.333,0.334 = equal mix (default uniform)")
-p.add_argument("--pursuit-horizon-offsets-ms", type=list_of_float, default=None,
-               help="pursuit_horizon: look-ahead offsets for the 3 slots (ms), default 0,100,200")
+# pacman (isometric force task)
+p.add_argument("--exec-ms",         type=int,   default=None, help="pursuit/pacman: profile duration (ms), default 2000")
+p.add_argument("--preview-ms",      type=int,   default=None, help="pursuit/pacman: rolling preview lead (ms), default 1000")
+p.add_argument("--peak-force-n",    type=float, default=None, help="pacman: peak target force (N), default 8")
+p.add_argument("--force-angle-deg", type=float, default=None, help="pacman: fixed force direction (deg), default 90")
+p.add_argument("--random-force-dir", action="store_true", help="pacman: randomize force direction per trial")
+p.add_argument("--prob-catch",      type=float, default=None, help="pacman: fraction of no-go catch trials, default 0.2")
+p.add_argument("--pacman-conditions", type=str, default=None,
+               help="pacman: comma-separated subset of conditions to train on (default: all 12)")
 p.add_argument("--go-pulse-ms", type=float, default=150,
                help="go-cue pulse duration (ms): the go input goes to 1 at go onset and back "
                     "to 0 after this long; 0 or negative = sustained cue (old step behaviour)")
@@ -196,18 +197,27 @@ elif args.task in ("hold_posture_pulse", "hold_posture_ramp"):
         if args.ramp_range_ms is not None: hk['ramp_range_ms'] = tuple(args.ramp_range_ms)
         if args.hold_after_ramp:          hk['hold_after_ramp'] = True
     task = make_task(args.task, eff, **hk)
-elif args.task in ("pursuit", "pursuit_horizon"):
-    pk = {'unified_input': args.unified_input}
-    if args.duration_ms          is not None: pk['duration_ms']   = args.duration_ms
-    if args.hold_range_ms        is not None: pk['hold_range_ms'] = tuple(args.hold_range_ms)
+elif args.task == "pursuit":
+    pk = {'unified_input': args.unified_input, 'go_pulse_ms': args.go_pulse_ms}
+    if args.exec_ms              is not None: pk['exec_ms']       = args.exec_ms
+    if args.preview_ms           is not None: pk['preview_ms']    = args.preview_ms
+    if args.prob_catch           is not None: pk['prob_catch']    = args.prob_catch
     if args.pursuit_speed        is not None: pk['speed']         = args.pursuit_speed
     if args.pursuit_speed_range  is not None: pk['speed_range']   = tuple(args.pursuit_speed_range)
     if args.pursuit_turn_tau_ms  is not None: pk['turn_tau_ms']   = args.pursuit_turn_tau_ms
     if args.pursuit_curviness    is not None: pk['curviness']     = args.pursuit_curviness
-    if args.task == "pursuit_horizon":
-        if args.pursuit_horizon_probs      is not None: pk['horizon_probs']      = tuple(args.pursuit_horizon_probs)
-        if args.pursuit_horizon_offsets_ms is not None: pk['horizon_offsets_ms'] = tuple(args.pursuit_horizon_offsets_ms)
     task = make_task(args.task, eff, **pk)
+elif args.task == "pacman":
+    mk = {'unified_input': args.unified_input, 'go_pulse_ms': args.go_pulse_ms}
+    if args.exec_ms          is not None: mk['exec_ms']        = args.exec_ms
+    if args.preview_ms       is not None: mk['preview_ms']     = args.preview_ms
+    if args.peak_force_n     is not None: mk['peak_force_n']   = args.peak_force_n
+    if args.force_angle_deg  is not None: mk['force_angle_deg'] = args.force_angle_deg
+    if args.random_force_dir:             mk['random_dir']     = True
+    if args.prob_catch       is not None: mk['prob_catch']     = args.prob_catch
+    if args.pacman_conditions is not None:
+        mk['conditions'] = [c.strip() for c in args.pacman_conditions.split(",") if c.strip()]
+    task = make_task(args.task, eff, **mk)
 elif args.task == "horizon_sequence":
     sk = {'desired_profile': args.desired_profile, **perturb_kw}
     if args.n_reaches        is not None: sk['n_reaches']        = args.n_reaches
@@ -222,6 +232,7 @@ elif args.task == "horizon_sequence":
 else:
     raise ValueError(f"Invalid task: {args.task}")
 URGENCY_TASKS = {"delayed_reach", "delayed_reach_posture"}          # single final target after a go
+IS_FORCE_TASK = getattr(task, "is_force_task", False)               # isometric force task (pacman)
 if args.task not in URGENCY_TASKS and args.w_loss_urgency > 0:
     print(f"WARNING: --w-loss-urgency penalizes distance to the FINAL target after the go cue, "
           f"which is only meaningful for a single-reach-to-a-fixed-target task. It is ignored "
@@ -267,7 +278,7 @@ if args.track:
 torch.manual_seed(123)
 num_eval = 30
 _saved = {}
-for _attr in ('perturb_prob', 'catch_prob'):
+for _attr in ('perturb_prob', 'catch_prob', 'prob_catch'):
     if hasattr(task, _attr):
         _saved[_attr] = getattr(task, _attr); setattr(task, _attr, 0.0)
 eval_theta0, eval_inp, eval_desired, eval_perturbation, eval_timestamps = task.make_batch(num_eval)
@@ -310,9 +321,14 @@ for i in tqdm(range(args.n_batch)):
                          obs_noise=args.obs_noise, neural_noise=args.neural_noise,
                          action_noise=args.action_noise)
 
-    # position loss
-    loss_pos = (states.pos - desired).abs().sum(-1).mean()
-    # jerk loss
+    # main tracking loss: force (isometric pacman) vs position (all other tasks). `desired` is a
+    # target FORCE for the force task and a target POSITION otherwise; states.force / states.pos
+    # is the matching generated quantity.
+    tracked = states.force if IS_FORCE_TASK else states.pos
+    loss_pos = (tracked - desired).abs().sum(-1).mean()
+    # jerk loss is a *movement*-smoothness penalty, always on position (frozen -> 0 for the
+    # isometric force task, whose force profile is meant to have sharp features and must NOT be
+    # penalised by the position-tuned jerk weight).
     _jerk = (states.pos[:, 3:] - 3 * states.pos[:, 2:-1]
         + 3 * states.pos[:, 1:-2] - states.pos[:, :-3])
     loss_jerk = _jerk.pow(2).sum(-1).mean()
@@ -331,12 +347,18 @@ for i in tqdm(range(args.n_batch)):
     #     final location. hmask (batch, T) is True only during those two hold epochs; both
     #     losses are averaged over the held steps so their scale is independent of epoch length.
     T = states.pos.shape[1]
-    hmask = hold_mask_from_ts(ts, T, states.pos.device).float()             # (n, T)
-    hden  = hmask.sum().clamp(min=1.0)
-    pos_err = (states.pos - desired).abs().sum(-1)                          # (n, T)
-    vel_sq  = states.vel.pow(2).sum(-1)                                     # (n, T)
-    loss_hold_pos = (pos_err * hmask).sum() / hden                         # heavier position at start+end
-    loss_hold_vel = (vel_sq  * hmask).sum() / hden                         # be still at start+end
+    if IS_FORCE_TASK:
+        # no position hold epoch for the isometric task; "hold zero force before go" is already
+        # enforced by loss_pos (desired force is 0 during preview and on catch trials).
+        loss_hold_pos = torch.zeros((), device=states.pos.device)
+        loss_hold_vel = torch.zeros((), device=states.pos.device)
+    else:
+        hmask = hold_mask_from_ts(ts, T, states.pos.device).float()             # (n, T)
+        hden  = hmask.sum().clamp(min=1.0)
+        pos_err = (states.pos - desired).abs().sum(-1)                          # (n, T)
+        vel_sq  = states.vel.pow(2).sum(-1)                                     # (n, T)
+        loss_hold_pos = (pos_err * hmask).sum() / hden                         # heavier position at start+end
+        loss_hold_vel = (vel_sq  * hmask).sum() / hden                         # be still at start+end
 
     # --- urgency: penalize still being far from the FINAL target as time passes after the go
     #     cue, with an exponentially-rising weight u(t) = 1 - exp(-(t - t_go)/tau). Movement
@@ -384,24 +406,31 @@ for i in tqdm(range(args.n_batch)):
         with torch.no_grad():
             ev = eff.rollout(controller, eval_theta0, eval_inp, eval_perturbation)
         controller.train()
-        err = 100 * (ev.pos[:, -1, :] - eval_desired[:, -1, :]).norm(dim=1).mean().item()
-        # keep the checkpoint with the lowest eval endpoint error (so late drift can't ship
+        if IS_FORCE_TASK:
+            # force error (N), averaged over the whole trial
+            err = (ev.force - eval_desired).norm(dim=-1).mean().item()
+        else:
+            err = 100 * (ev.pos[:, -1, :] - eval_desired[:, -1, :]).norm(dim=1).mean().item()
+        # keep the checkpoint with the lowest eval error (so late drift can't ship
         # a worse model than an earlier, better one).
         if err < best_err:
             best_err = err
             torch.save(controller.state_dict(), best_path)
         if args.track:
-            # randomly select num_eval_to_plot indices from eval_desiered
-            fr = fig_reaches(ev.pos, eval_desired, title=f"reaches @ batch {i+1} (err {err:.1f} cm)")
-            fd = fig_diagnostics(eff, ev, eval_inp, eval_desired, title=f"diagnostics @ batch {i+1}",  num_trial=5)
-            wandb.log({"eval/endpoint_error_cm": err,
-                       "eval/best_endpoint_error_cm": best_err,
+            if IS_FORCE_TASK:
+                fr = fig_diagnostics(eff, ev, eval_inp, eval_desired, title=f"force @ batch {i+1} (err {err:.2f} N)", num_trial=5)
+                fd = fig_diagnostics(eff, ev, eval_inp, eval_desired, title=f"diagnostics @ batch {i+1}", num_trial=5)
+            else:
+                fr = fig_reaches(ev.pos, eval_desired, title=f"reaches @ batch {i+1} (err {err:.1f} cm)")
+                fd = fig_diagnostics(eff, ev, eval_inp, eval_desired, title=f"diagnostics @ batch {i+1}",  num_trial=5)
+            wandb.log({"eval/error": err,
+                       "eval/best_error": best_err,
                        "eval/reaches": wandb.Image(fr),
                        "eval/diagnostics": wandb.Image(fd)}, step=i)
             plt.close(fr); plt.close(fd)
 
 print(f"Training complete.  start loss {loss_hist[0]:.5f} -> final loss {loss_hist[-1]:.5f}")
-print(f"best eval endpoint error {best_err:.2f} cm  (saved to {os.path.basename(best_path)})")
+print(f"best eval error {best_err:.3f}  (saved to {os.path.basename(best_path)})")
 torch.save(controller.state_dict(), out(f"controller_{args.effector}_{args.arch}.pt"))
 
 
@@ -412,7 +441,10 @@ lc = fig_learning_curve(loss_hist, f'learning curve ({tag})')
 controller.eval()
 with torch.no_grad():
     ev = eff.rollout(controller, eval_theta0, eval_inp, eval_perturbation)
-td = fig_diagnostics(eff, ev, eval_inp, eval_desired, title=f"Sample trials ({tag}; dotted line = go cue)", num_trial=5)
+if IS_FORCE_TASK:
+    td = fig_diagnostics(eff, ev, eval_inp, eval_desired, title=f"Sample force trials ({tag})", num_trial=5)
+else:
+    td = fig_diagnostics(eff, ev, eval_inp, eval_desired, title=f"Sample trials ({tag}; dotted line = go cue)", num_trial=5)
 lc.savefig(out('learning_curve.png'), dpi=120, bbox_inches='tight')
 td.savefig(out('trial_diagnostics.png'), dpi=120, bbox_inches='tight')
 print(f"\nsaved plots + controller to {run_dir}")

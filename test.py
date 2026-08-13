@@ -50,7 +50,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from effectors import make_effector
-from tasks import make_task, TASKS, task_input_channels
+from tasks import make_task, TASKS, task_input_channels, PacManTask
 from controllers import GRUController, ModularGRU
 from utils import fig_reaches, fig_diagnostics
 
@@ -118,17 +118,25 @@ def build_task(cfg, effector):
         if cfg.get("prob_no_go")       is not None: kw["prob_no_go"]       = cfg["prob_no_go"]
         if cfg.get("prob_no_go_reach") is not None: kw["prob_no_go_reach"] = cfg["prob_no_go_reach"]
         return make_task(name, effector, **kw)
-    elif name in ("pursuit", "pursuit_horizon"):
-        kw = {"unified_input": unified}
-        if cfg.get("duration_ms")         is not None: kw["duration_ms"]   = cfg["duration_ms"]
-        if cfg.get("hold_range_ms")       is not None: kw["hold_range_ms"] = tuple(cfg["hold_range_ms"])
-        if cfg.get("pursuit_speed")       is not None: kw["speed"]         = cfg["pursuit_speed"]
-        if cfg.get("pursuit_speed_range") is not None: kw["speed_range"]   = tuple(cfg["pursuit_speed_range"])
-        if cfg.get("pursuit_turn_tau_ms") is not None: kw["turn_tau_ms"]   = cfg["pursuit_turn_tau_ms"]
-        if cfg.get("pursuit_curviness")   is not None: kw["curviness"]     = cfg["pursuit_curviness"]
-        if name == "pursuit_horizon":
-            if cfg.get("pursuit_horizon_probs")      is not None: kw["horizon_probs"]      = tuple(cfg["pursuit_horizon_probs"])
-            if cfg.get("pursuit_horizon_offsets_ms") is not None: kw["horizon_offsets_ms"] = tuple(cfg["pursuit_horizon_offsets_ms"])
+    elif name == "pursuit":
+        kw = {"unified_input": unified, "go_pulse_ms": go_pulse_ms}
+        if cfg.get("exec_ms")             is not None: kw["exec_ms"]      = cfg["exec_ms"]
+        if cfg.get("preview_ms")          is not None: kw["preview_ms"]   = cfg["preview_ms"]
+        if cfg.get("prob_catch")          is not None: kw["prob_catch"]   = cfg["prob_catch"]
+        if cfg.get("pursuit_speed")       is not None: kw["speed"]        = cfg["pursuit_speed"]
+        if cfg.get("pursuit_speed_range") is not None: kw["speed_range"]  = tuple(cfg["pursuit_speed_range"])
+        if cfg.get("pursuit_turn_tau_ms") is not None: kw["turn_tau_ms"]  = cfg["pursuit_turn_tau_ms"]
+        if cfg.get("pursuit_curviness")   is not None: kw["curviness"]    = cfg["pursuit_curviness"]
+        return make_task(name, effector, **kw)
+    elif name == "pacman":
+        kw = {"unified_input": unified, "go_pulse_ms": go_pulse_ms}
+        if cfg.get("exec_ms")         is not None: kw["exec_ms"]         = cfg["exec_ms"]
+        if cfg.get("preview_ms")      is not None: kw["preview_ms"]      = cfg["preview_ms"]
+        if cfg.get("peak_force_n")    is not None: kw["peak_force_n"]    = cfg["peak_force_n"]
+        if cfg.get("force_angle_deg") is not None: kw["force_angle_deg"] = cfg["force_angle_deg"]
+        if cfg.get("random_dir")      is not None: kw["random_dir"]      = cfg["random_dir"]
+        if cfg.get("prob_catch")      is not None: kw["prob_catch"]      = cfg["prob_catch"]
+        if cfg.get("conditions")      is not None: kw["conditions"]      = cfg["conditions"]
         return make_task(name, effector, **kw)
     raise ValueError(f"unknown task in config: {name!r}")
 
@@ -172,8 +180,10 @@ def _apply_task_timing(cfg, spec):
         spec.setdefault("dwell_steps", 50); spec.setdefault("final_steps", 40)
     elif cfg.get("task") in ("hold_posture_pulse", "hold_posture_ramp"):
         pass                                                    # timing sampled by the task itself
-    elif cfg.get("task") in ("pursuit", "pursuit_horizon"):
+    elif cfg.get("task") == "pursuit":
         pass                                                    # timing sampled by the task itself
+    elif cfg.get("task") == "pacman":
+        pass                                                    # timing/conditions handled by the task
     else:                                                        # delayed_reach_posture
         spec.setdefault("init_steps", 40);  spec.setdefault("delay_steps", 50)
         spec.setdefault("move_steps", 120); spec.setdefault("final_steps", 40)
@@ -282,10 +292,8 @@ def spec_hold(cfg, effector, n_dirs=8):
 
 def spec_pursuit(cfg, effector, n_trials=6):
     """A handful of pursuit trials from the workspace-center posture (distinct random paths per
-    trial, reproducible via the harness seed). For pursuit_horizon the trials sweep H1/H2/H3 so
-    the horizons can be compared on comparable paths. Applies to pursuit and pursuit_horizon."""
-    task = cfg.get("task")
-    if task not in ("pursuit", "pursuit_horizon"):
+    trial, reproducible via the harness seed). Only applies to the pursuit task."""
+    if cfg.get("task") != "pursuit":
         return None
     if effector.name == "point_mass":
         lo, hi = effector.pos_range
@@ -296,14 +304,33 @@ def spec_pursuit(cfg, effector, n_trials=6):
         elb = 0.5 * (effector.elb_range[0] + effector.elb_range[1])
         center = [sho, elb]
         start_space = "joint"
-    spec = {"start_space": start_space, "start": [center] * n_trials}
-    if task == "pursuit_horizon":
-        spec["horizon"] = [(i % 3) + 1 for i in range(n_trials)]     # cycle H1, H2, H3
+    spec = {"start_space": start_space, "start": [center] * n_trials, "catch": False}
+    return _apply_task_timing(cfg, spec)
+
+
+def spec_pacman(cfg, effector):
+    """One trial per force condition from the workspace-center posture, so the network's generated
+    force can be compared against every target profile. Only applies to the pacman task."""
+    if cfg.get("task") != "pacman":
+        return None
+    conds = cfg.get("conditions") or list(PacManTask.CONDITIONS)
+    if effector.name == "point_mass":
+        lo, hi = effector.pos_range
+        center = [0.5 * (lo + hi)] * 2
+        start_space = "cartesian"
+    else:
+        sho = 0.5 * (effector.sho_range[0] + effector.sho_range[1])
+        elb = 0.5 * (effector.elb_range[0] + effector.elb_range[1])
+        center = [sho, elb]
+        start_space = "joint"
+    spec = {"start_space": start_space, "start": [center] * len(conds),
+            "condition": conds, "catch": False}
     return _apply_task_timing(cfg, spec)
 
 
 BUILTIN_SPECS = {"center_out": spec_center_out, "point2point": spec_point2point,
-                 "sequence": spec_sequence, "hold": spec_hold, "pursuit": spec_pursuit}
+                 "sequence": spec_sequence, "hold": spec_hold, "pursuit": spec_pursuit,
+                 "pacman": spec_pacman}
 
 
 # ----------------------------------------------------------------------------- run one folder
@@ -317,17 +344,26 @@ def _run_one_spec(folder, name, spec, eff, controller, task, cfg,
         states = eff.rollout(controller, theta0, inp, pert,
                              obs_noise=obs_noise, neural_noise=neural_noise)
 
-    err = 100 * (states.pos[:, -1, :] - desired[:, -1, :]).norm(dim=1).mean().item()
-    n = theta0.shape[0]
-
+    is_force = getattr(task, "is_force_task", False)
     out_dir = os.path.join(folder, "test", name)
     os.makedirs(out_dir, exist_ok=True)
+    n = theta0.shape[0]
 
-    fr = fig_reaches(states.pos, desired,
-                     title=f"{cfg['effector']}/{cfg['arch']} {name} (final err {err:.1f} cm)")
-    fd = fig_diagnostics(eff, states, inp, desired,
-                         title=f"{name} diagnostics ({cfg['effector']}/{cfg['arch']})",
-                         num_trial=min(num_plot, n))
+    if is_force:
+        err = (states.force - desired).norm(dim=-1).mean().item()               # mean force error (N)
+        fr = fig_diagnostics(eff, states, inp, desired,
+                             title=f"{cfg['effector']}/{cfg['arch']} {name} (force err {err:.2f} N)",
+                             num_trial=min(num_plot, n))
+        fd = fr
+        err_str = f"{err:.2f} N"
+    else:
+        err = 100 * (states.pos[:, -1, :] - desired[:, -1, :]).norm(dim=1).mean().item()
+        fr = fig_reaches(states.pos, desired,
+                         title=f"{cfg['effector']}/{cfg['arch']} {name} (final err {err:.1f} cm)")
+        fd = fig_diagnostics(eff, states, inp, desired,
+                             title=f"{name} diagnostics ({cfg['effector']}/{cfg['arch']})",
+                             num_trial=min(num_plot, n))
+        err_str = f"{err:.2f} cm"
     fr.savefig(os.path.join(out_dir, "reaches.png"), dpi=120, bbox_inches="tight")
     fd.savefig(os.path.join(out_dir, "diagnostics.png"), dpi=120, bbox_inches="tight")
     plt.close(fr); plt.close(fd)
@@ -346,7 +382,7 @@ def _run_one_spec(folder, name, spec, eff, controller, task, cfg,
     with open(os.path.join(out_dir, "spec_used.json"), "w") as f:
         json.dump(spec, f, indent=2)
 
-    print(f"      {name:12s} n={n:3d}  final endpoint err {err:.2f} cm  -> {out_dir}")
+    print(f"      {name:12s} n={n:3d}  err {err_str}  -> {out_dir}")
     return err
 
 
@@ -376,7 +412,7 @@ def main():
     ap.add_argument("--spec", action="append", default=None,
                     help="path to a user JSON spec; repeatable. Each is named by its filename "
                          "and run in addition to the built-in specs.")
-    ap.add_argument("--builtin", default="center_out,point2point,sequence,hold,pursuit",
+    ap.add_argument("--builtin", default="center_out,point2point,sequence,hold,pursuit,pacman",
                     help="comma-separated built-in specs to run "
                          f"(choices: {', '.join(BUILTIN_SPECS)}; pass 'none' to skip them)")
     ap.add_argument("--device", default="cpu")

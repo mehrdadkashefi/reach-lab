@@ -27,8 +27,8 @@ from types import SimpleNamespace
 import torch
 
 from physics import (point_mass_step, arm_step, arm_fingertip, arm_jacobian_T_force,
-                     arm26_to, arm26_muscle_step, arm26_muscle_length,
-                     muscle_activation_step)
+                     arm_endpoint_force, arm26_to, arm26_muscle_step, arm26_muscle_length,
+                     arm26_muscle_torque, muscle_activation_step)
 
 # default arm range of motion (rad): shoulder 0-135 deg, elbow 0-155 deg
 DEFAULT_JOINT_LIMITS = ((0.0, math.radians(135)), (0.0, math.radians(155)))
@@ -72,11 +72,16 @@ class Effector:
     action_names = []
     state_specs = {}
 
-    def __init__(self, dt=0.01, vis_delay_ms=70, pro_delay_ms=25, task_dim=4, **kwargs):
+    def __init__(self, dt=0.01, vis_delay_ms=70, pro_delay_ms=25, task_dim=4,
+                 isometric=False, **kwargs):
         self.dt = dt
         self.vis_delay_ms = vis_delay_ms
         self.pro_delay_ms = pro_delay_ms
         self.task_dim = int(task_dim)                 # width of the task/instruction stream
+        # isometric mode: the plant is held fixed at its start posture (no movement) and each
+        # step records the actuator's Cartesian endpoint force in `states.force`. Set by the
+        # PacMan force task; leaves every moving task untouched.
+        self.isometric = bool(isometric)
         self.device = torch.device("cpu")
 
     # --- derived ---
@@ -208,7 +213,7 @@ class PointMass(Effector):
         self.mass = mass
         self.force_scale = force_scale
         self.action_names = ['Fx', 'Fy']
-        self.state_specs = {'pos': 2, 'vel': 2, 'action': 2}
+        self.state_specs = {'pos': 2, 'vel': 2, 'action': 2, 'force': 2}
 
     def sample_joint(self, n):
         lo, hi = self.pos_range
@@ -239,6 +244,9 @@ class PointMass(Effector):
         return self.force_scale * (2.0 * out - 1.0)   # [0,1] -> signed force
 
     def step(self, st, force, pert=None):
+        if self.isometric:
+            # held fixed; the endpoint force IS the commanded control force
+            return {'pos': st['pos'], 'vel': torch.zeros_like(st['vel']), 'force': force}
         applied = force if pert is None else force + pert        # external perturbation force
         pos, vel = point_mass_step(st['pos'], st['vel'], applied, self.dt, self.mass)
         return {'pos': pos, 'vel': vel, 'force': force}          # store the control force (for effort)
@@ -248,7 +256,7 @@ class PointMass(Effector):
                 'proprio': torch.cat([st['pos'], st['vel']], dim=1)}
 
     def collect(self, st, fb):
-        return {'pos': st['pos'], 'vel': st['vel'], 'action': st['force']}
+        return {'pos': st['pos'], 'vel': st['vel'], 'action': st['force'], 'force': st['force']}
 
 
 # ----------------------------------------------------------------------------- torque arm
@@ -270,7 +278,7 @@ class TwoJointArm(Effector):
         self.lim = (float(slo), float(shi), float(elo), float(ehi))
         self.l1, self.l2 = 0.309, 0.333               # link lengths; must match arm_fingertip()
         self.action_names = ['shoulder torque', 'elbow torque']
-        self.state_specs = {'pos': 2, 'vel': 2, 'joints': 2, 'action': 2}
+        self.state_specs = {'pos': 2, 'vel': 2, 'joints': 2, 'action': 2, 'force': 2}
 
     def sample_joint(self, n):
         sho = torch.rand(n, 1, device=self.device) * (self.sho_range[1] - self.sho_range[0]) + self.sho_range[0]
@@ -312,9 +320,13 @@ class TwoJointArm(Effector):
         return self.torque_scale * (2.0 * out - 1.0)  # [0,1] -> signed torque
 
     def step(self, st, tau, pert=None):
+        endforce = arm_endpoint_force(st['theta'], tau)          # Cartesian force from joint torque
+        if self.isometric:
+            return {'theta': st['theta'], 'omega': torch.zeros_like(st['omega']),
+                    'tau': tau, 'force': endforce}               # posture held fixed
         applied = tau if pert is None else tau + pert            # external perturbation torque
         theta, omega = arm_step(st['theta'], st['omega'], applied, self.dt, *self.lim)
-        return {'theta': theta, 'omega': omega, 'tau': tau}      # store the control torque (for effort)
+        return {'theta': theta, 'omega': omega, 'tau': tau, 'force': endforce}
 
     def feedback(self, st):
         ft = arm_fingertip(st['theta'], st['omega'])
@@ -322,7 +334,8 @@ class TwoJointArm(Effector):
                 'proprio': torch.cat([st['theta'], st['omega']], dim=1)}
 
     def collect(self, st, fb):
-        return {'pos': fb['fingertip'], 'vel': fb['vel'], 'joints': st['theta'], 'action': st['tau']}
+        return {'pos': fb['fingertip'], 'vel': fb['vel'], 'joints': st['theta'],
+                'action': st['tau'], 'force': st['force']}
 
 
 # ----------------------------------------------------------------------------- muscle arm (arm26)
@@ -347,7 +360,7 @@ class Arm26(Effector):
         self.n_muscles = len(self.muscle_names)
         self.action_names = self.muscle_names
         self.state_specs = {'pos': 2, 'vel': 2, 'joints': 2,
-                            'muscle_length': 6, 'activation': 6, 'action': 6}
+                            'muscle_length': 6, 'activation': 6, 'action': 6, 'force': 2}
 
     def to(self, device):
         super().to(device)
@@ -394,10 +407,14 @@ class Arm26(Effector):
         return out                                    # excitation in [0,1]
 
     def step(self, st, excitation, pert=None):
-        act = muscle_activation_step(st['act'], excitation, self.dt)
+        act = muscle_activation_step(st['act'], excitation, self.dt)   # activation dynamics still run
+        endforce = arm_endpoint_force(st['theta'], arm26_muscle_torque(st['theta'], act))
+        if self.isometric:
+            return {'theta': st['theta'], 'omega': torch.zeros_like(st['omega']),
+                    'act': act, 'force': endforce}                     # posture held fixed
         # external perturbation enters as a joint torque added to the muscle torque
         theta, omega = arm26_muscle_step(st['theta'], st['omega'], act, self.dt, pert, *self.lim)
-        return {'theta': theta, 'omega': omega, 'act': act}
+        return {'theta': theta, 'omega': omega, 'act': act, 'force': endforce}
 
     def feedback(self, st):
         ft = arm_fingertip(st['theta'], st['omega'])
@@ -407,7 +424,8 @@ class Arm26(Effector):
 
     def collect(self, st, fb):
         return {'pos': fb['fingertip'], 'vel': fb['vel'], 'joints': st['theta'],
-                'muscle_length': fb['ml'], 'activation': st['act'], 'action': st['act']}
+                'muscle_length': fb['ml'], 'activation': st['act'], 'action': st['act'],
+                'force': st['force']}
 
 
 # ----------------------------------------------------------------------------- factory

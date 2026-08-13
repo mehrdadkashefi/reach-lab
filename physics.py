@@ -96,6 +96,28 @@ def arm_jacobian_T_force(theta, force_xy):
 
 
 @torch.jit.script
+def arm_endpoint_force(theta, tau):
+    """Inverse of arm_jacobian_T_force: the Cartesian fingertip force F that a joint torque tau
+    produces at posture theta, F = (J^T)^{-1} tau.  theta, tau: (batch, 2) -> force (batch, 2).
+    Used for the isometric force readout (near a singular/extended posture det->0, so callers
+    should keep postures away from full extension)."""
+    l1 = 0.309; l2 = 0.333
+    sho = theta[:, 0]
+    s = sho + theta[:, 1]
+    s1 = torch.sin(sho); c1 = torch.cos(sho)
+    s12 = torch.sin(s);  c12 = torch.cos(s)
+    # J^T = [[j11, j21], [j12, j22]] (rows map F->tau, see arm_jacobian_T_force)
+    j11 = -(l1 * s1 + l2 * s12); j12 = -l2 * s12
+    j21 =  (l1 * c1 + l2 * c12); j22 =  l2 * c12
+    det = j11 * j22 - j21 * j12
+    det = torch.where(det.abs() < 1e-6, torch.full_like(det, 1e-6), det)
+    ts = tau[:, 0]; te = tau[:, 1]
+    fx = ( j22 * ts - j21 * te) / det
+    fy = (-j12 * ts + j11 * te) / det
+    return torch.stack([fx, fy], dim=1)
+
+
+@torch.jit.script
 def arm_fingertip(theta, omega):
     """Forward kinematics: joint state -> fingertip (x, y, vx, vy).  theta, omega: (batch, 2)."""
     l1 = 0.309; l2 = 0.333
@@ -164,6 +186,15 @@ def arm26_muscle_length(theta):
     q = theta.unsqueeze(-1) - _A3.view(1, 2, 1)
     a1 = _A1.unsqueeze(0); a2 = _A2.unsqueeze(0)
     return ((a1 + q * a2) * q).sum(1) + _A0.view(1, 6)
+
+
+def arm26_muscle_torque(theta, activation):
+    """Joint torque (batch,2) produced by the 6 muscles at posture theta given activation (batch,6).
+    Same ReLU-muscle torque as arm26_muscle_step, but without advancing the arm (for isometric
+    force readout). Velocity is irrelevant to the torque here, so moment arms use omega=0."""
+    moment_arm, _, _ = arm26_moment_arms(theta, torch.zeros_like(theta))   # (batch,2,6)
+    force = activation.unsqueeze(1) * _FMAX.view(1, 1, 6)                   # (batch,1,6)
+    return -(force * moment_arm).sum(-1)                                    # (batch,2)
 
 
 def arm26_muscle_step(theta, omega, activation, dt: float = 0.01, ext_tau=None,
