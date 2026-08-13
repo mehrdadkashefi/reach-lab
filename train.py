@@ -47,17 +47,6 @@ p.add_argument("--w-loss-action", type=float, default=0.5)
 p.add_argument("--w-loss-action-diff", type=float, default=3e-3)
 p.add_argument("--w-loss-hidden", type=float, default=3e-4)
 p.add_argument("--w-loss-hidden-diff", type=float, default=3e-2)
-# extra emphasis on the hold epochs (before go = start posture, and after movement = final hold)
-p.add_argument("--w-loss-hold-pos", type=float, default=5.0,
-               help="extra position (L1) loss applied only during the start + final hold epochs")
-p.add_argument("--w-loss-hold-vel", type=float, default=1.0,
-               help="velocity (squared) loss applied only during the start + final hold epochs")
-# urgency: push the network to reach fast without shortening the move window
-p.add_argument("--w-loss-urgency", type=float, default=0.0,
-               help="weight on a time-rising penalty of distance-to-final-target after the go "
-                    "cue; encourages a fast, early-peaking reach. 0 = off (default)")
-p.add_argument("--urgency-tau-ms", type=float, default=300.0,
-               help="time constant (ms) of the urgency ramp; smaller = more urgent / faster reach")
 # noise in traininz
 p.add_argument("--obs-noise", type=float, default=0.1,
                help="std of Gaussian noise on observed body state (vision fingertip + proprio); 0 = off")
@@ -231,12 +220,7 @@ elif args.task == "horizon_sequence":
     task = make_task(args.task, eff, **sk)
 else:
     raise ValueError(f"Invalid task: {args.task}")
-URGENCY_TASKS = {"delayed_reach", "delayed_reach_posture"}          # single final target after a go
 IS_FORCE_TASK = getattr(task, "is_force_task", False)               # isometric force task (pacman)
-if args.task not in URGENCY_TASKS and args.w_loss_urgency > 0:
-    print(f"WARNING: --w-loss-urgency penalizes distance to the FINAL target after the go cue, "
-          f"which is only meaningful for a single-reach-to-a-fixed-target task. It is ignored "
-          f"for task {args.task!r} (a moving/sequenced/held target has no single final target).")
 print(f"effector: {eff.name}  (input_dim={eff.input_dim}, output_dim={eff.output_dim}, "
       f"vis_d={eff.vis_d}, pro_d={eff.pro_d})")
 print(f"task: {task.name}  (episode {task.steps} steps = {task.steps * args.dt:.2f} s)")
@@ -287,30 +271,6 @@ for _attr, _val in _saved.items():
 torch.manual_seed(args.seed)
 
 
-def hold_mask_from_ts(ts, T, device):
-    """(batch, T) bool mask that is True during the start hold (before go) and the final hold.
-
-    Uses the per-trial epoch boundaries returned by the task:
-      - hold_posture_*:        whole episode is a hold
-      - delayed_reach_posture / horizon_sequence: start hold = t < move_start, final hold = t >= final_start
-      - pursuit:               start hold = t < move_start (no final hold; it tracks afterwards)
-      - delayed_reach:         start hold = t < go_start   (no explicit final-hold epoch)
-    """
-    n = ts['episode_end'].shape[0]
-    tg = torch.arange(T, device=device).unsqueeze(0)                    # (1, T)
-    if 'bump_onset' in ts:                                             # hold_posture_* : hold all episode
-        return torch.ones(n, T, dtype=torch.bool, device=device)
-    if 'move_start' in ts:                                              # posture / sequence / pursuit
-        start_hold = tg < ts['move_start'].to(device).unsqueeze(1)
-        if 'final_start' in ts:                                        # posture / sequence have a final hold
-            end_hold = tg >= ts['final_start'].to(device).unsqueeze(1)
-        else:                                                          # pursuit: no final hold
-            end_hold = torch.zeros_like(start_hold)
-    else:                                                               # delayed_reach
-        start_hold = tg < ts['go_start'].to(device).unsqueeze(1)
-        end_hold   = torch.zeros_like(start_hold)
-    return (start_hold | end_hold)                                     # (n, T) bool
-
 # ----------------------------------------------------------------------------- train
 loss_hist, snapshots = [], []
 best_err = float('inf')                                   # lowest eval endpoint error so far
@@ -343,48 +303,9 @@ for i in tqdm(range(args.n_batch)):
     loss_hidden = _hidden.pow(2).sum(-1).mean()
     loss_hidden_diff = _hidden_diff.pow(2).sum(-1).mean()
 
-    # --- hold-epoch losses: extra emphasis on holding still at the start posture and at the
-    #     final location. hmask (batch, T) is True only during those two hold epochs; both
-    #     losses are averaged over the held steps so their scale is independent of epoch length.
-    T = states.pos.shape[1]
-    if IS_FORCE_TASK:
-        # no position hold epoch for the isometric task; "hold zero force before go" is already
-        # enforced by loss_pos (desired force is 0 during preview and on catch trials).
-        loss_hold_pos = torch.zeros((), device=states.pos.device)
-        loss_hold_vel = torch.zeros((), device=states.pos.device)
-    else:
-        hmask = hold_mask_from_ts(ts, T, states.pos.device).float()             # (n, T)
-        hden  = hmask.sum().clamp(min=1.0)
-        pos_err = (states.pos - desired).abs().sum(-1)                          # (n, T)
-        vel_sq  = states.vel.pow(2).sum(-1)                                     # (n, T)
-        loss_hold_pos = (pos_err * hmask).sum() / hden                         # heavier position at start+end
-        loss_hold_vel = (vel_sq  * hmask).sum() / hden                         # be still at start+end
-
-    # --- urgency: penalize still being far from the FINAL target as time passes after the go
-    #     cue, with an exponentially-rising weight u(t) = 1 - exp(-(t - t_go)/tau). Movement
-    #     time is set by urgency_tau_ms, decoupled from the length of the go/move window, so a
-    #     small tau forces a fast, early-peaking reach even in a long window. off when weight 0.
-    dev = states.pos.device
-    go_key = 'move_start' if 'move_start' in ts else ('go_start' if 'go_start' in ts else None)
-    if args.task not in URGENCY_TASKS or go_key is None:                              # no single final target
-        loss_urgency = torch.zeros((), device=dev)
-    else:
-        go_step = ts[go_key].to(dev)                                                  # (n,)
-        tgs = torch.arange(T, device=dev).unsqueeze(0)                                # (1, T)
-        tau_u = max(1.0, args.urgency_tau_ms / 1000.0 / args.dt)                      # steps
-        dgo = (tgs - go_step.unsqueeze(1)).clamp(min=0)                               # steps since go
-        u = (1.0 - torch.exp(-dgo / tau_u)) * (tgs >= go_step.unsqueeze(1)).float()   # (n, T)
-        if 'is_no_go' in ts:
-            u = u * (~ts['is_no_go']).float().unsqueeze(1)                            # no urgency on no-go
-        final_tgt = desired[:, -1:, :]                                                # (n, 1, 2)
-        dist_final = (states.pos - final_tgt).abs().sum(-1)                           # (n, T)
-        loss_urgency = (dist_final * u).sum() / u.sum().clamp(min=1.0)
-
     loss = (args.w_loss_pos * loss_pos + args.w_loss_jerk * loss_jerk
             + args.w_loss_action * loss_action + args.w_loss_action_diff * loss_action_diff
-            + args.w_loss_hidden * loss_hidden + args.w_loss_hidden_diff * loss_hidden_diff
-            + args.w_loss_hold_pos * loss_hold_pos + args.w_loss_hold_vel * loss_hold_vel
-            + args.w_loss_urgency * loss_urgency)
+            + args.w_loss_hidden * loss_hidden + args.w_loss_hidden_diff * loss_hidden_diff)
 
     opt.zero_grad()
     loss.backward()
@@ -395,9 +316,7 @@ for i in tqdm(range(args.n_batch)):
     if args.track:
         contrib = {'loss_tot': loss, 'pos': args.w_loss_pos * loss_pos, 'jerk': args.w_loss_jerk * loss_jerk,
             'muscle': args.w_loss_action * loss_action, 'muscle_diff': args.w_loss_action_diff * loss_action_diff, 'hidden':args.w_loss_hidden * loss_hidden,
-            'hidden_diff':  args.w_loss_hidden_diff * loss_hidden_diff,
-            'hold_pos': args.w_loss_hold_pos * loss_hold_pos, 'hold_vel': args.w_loss_hold_vel * loss_hold_vel,
-            'urgency': args.w_loss_urgency * loss_urgency }
+            'hidden_diff':  args.w_loss_hidden_diff * loss_hidden_diff }
 
         wandb.log({f'{k}': v.item() for k, v in contrib.items()}, step=i)
 
