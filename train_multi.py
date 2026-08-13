@@ -225,9 +225,9 @@ def main():
     p.add_argument("--w-loss-hidden", type=float, default=3e-4)
     p.add_argument("--w-loss-hidden-diff", type=float, default=3e-2)
     # noise
-    p.add_argument("--obs-noise", type=float, default=0.1)
-    p.add_argument("--neural-noise", type=float, default=0.05)
-    p.add_argument("--action-noise", type=float, default=0.0)
+    p.add_argument("--obs-noise", type=float, default=0.001)
+    p.add_argument("--neural-noise", type=float, default=0.001)
+    p.add_argument("--action-noise", type=float, default=0.0001)
     p.add_argument("--track", action="store_true", help="log to wandb")
     p.add_argument("--wandb-project", default="reach-lab-multitask")
     args = p.parse_args()
