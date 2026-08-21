@@ -125,8 +125,8 @@ p.add_argument("--dwell-range-ms", type=list_of_int, default=None,
 p.add_argument("--horizon-probs",  type=list_of_float, default=None,
                help="P(horizon = 1, 2, 3); default uniform")
 p.add_argument("--prob-no-go-reach", type=float,     default=None,
-               help="fraction of trials where one random capture gets no go pulse "
-                    "(hold at the captured target; sequence aborts)")
+               help="fraction of trials where one random reach gets no go pulse "
+                    "(the hand holds through that segment; the sequence resumes after)")
 # --- controller config ---
 p.add_argument("--hidden-dim", type=int, default=128, help="baseline gru hidden size")
 # modular overrides: leave as None to use ModularGRU's own defaults

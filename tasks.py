@@ -417,10 +417,12 @@ class HorizonSequence:
     No-go variants (independent):
         prob_no_go       : the go pulse never fires; the targets stay as in the delay and
                            the hand must hold at the start posture the whole episode.
-        prob_no_go_reach : one random capture k >= 2 delivers no go pulse; the next target
-                           appears in slot 1 but the hand must hold at the just-captured
-                           target for the rest of the episode (the sequence aborts). This
-                           teaches "move only on a pulse", per reach.
+        prob_no_go_reach : one random reach r (1 <= r <= n_reaches-1) receives no go pulse, so
+                           the hand simply stays where it is for that segment -- reach r-1's
+                           dwell is effectively extended -- and the sequence then RESUMES
+                           normally at reach r+1. Target r is shown during its segment but
+                           never reached (it is skipped). This teaches "move only on a pulse",
+                           per reach, without ending the trial.
 
     The desired trajectory jumps to the current target at each go pulse ('step') or ramps
     to it with a minimum-jerk profile over mj_move_steps ('min_jerk'), then holds.
@@ -507,8 +509,9 @@ class HorizonSequence:
             dwell_steps              : per-reach segment length; scalar, (n_reaches,) or
                                        (n, n_reaches) (default: dwell range midpoint)
             no_go        (False)     : trial-level no-go (never any go pulse)
-            no_go_reach  (-1)        : index (1..n_reaches-1) of a reach whose pulse is
-                                       withheld (sequence aborts there); -1 = none
+            no_go_reach  (-1)        : index (1..n_reaches-1) of the reach whose pulse is
+                                       withheld -- the hand holds through that segment and the
+                                       sequence resumes at the next reach; -1 = none
             go_pulse_steps           : go-cue pulse length in steps (default: task's
                                        go_pulse_ms; 0 or negative -> sustained cue)
             perturbation             : {'value', 't_start', 't_end'} or None
@@ -563,12 +566,18 @@ class HorizonSequence:
         pulse_times = torch.cat([t_go, bounds[:, :-1]], dim=1)          # (n, R) go for reach k
         final_start = bounds[:, -1]                                     # (n,)
 
-        # cap = how far the sequence actually runs: R normally, 0 on trial no-go, r on a
-        # reach no-go (reach r is cued r < cap; slot content / desired freeze at cap).
+        # Two independent no-go variants, both implemented here:
+        #   trial no-go (cap = 0): no pulse ever fires and the hand holds at the start posture for
+        #       the whole episode; the target display freezes at the beginning of the sequence.
+        #   reach no-go (skip = r): reach r alone receives no pulse, so the hand simply stays where
+        #       it is for that segment -- reach r-1's dwell is effectively extended -- and the
+        #       sequence then RESUMES normally at reach r+1 (target r is skipped, never reached).
         cap = torch.full((n,), R, dtype=torch.long, device=dev)
         cap = torch.where(nogo, torch.zeros_like(cap), cap)
-        has_r = no_go_reach >= 0
-        cap = torch.where(has_r, no_go_reach.clamp(1, R), cap)
+        skip = no_go_reach.clone()                                      # (n,) -1 = no skipped reach
+        skip = torch.where(nogo, torch.full_like(skip, -1), skip)       # variants are exclusive
+        skip_col = skip.unsqueeze(1)                                    # (n, 1)
+        has_skip = (skip >= 0).unsqueeze(1)
 
         tg = torch.arange(T, device=dev).unsqueeze(0)                   # (1, T)
         cur = (tg.unsqueeze(-1) >= bounds.unsqueeze(1)).sum(-1)         # (n, T) captures so far
@@ -586,23 +595,26 @@ class HorizonSequence:
             inp[:, :, 3 * j + 1] = ty.gather(1, idxc) * on.float()
             inp[:, :, 3 * j + 2] = on.float()
 
-        # go channel: one pulse per cued reach (k < cap), at t_go and at each capture
+        # go channel: one pulse per cued reach, at t_go and at each capture. A skipped reach (and
+        # every reach on a trial no-go) gets no pulse; the rest are unaffected.
         go = torch.zeros(n, T, device=dev)
         if pulse is None:                                               # sustained fallback
-            go = ((tg >= t_go) & (cur < cap.unsqueeze(1))).float()
+            go = ((tg >= t_go) & (cur < cap.unsqueeze(1))
+                  & ~(has_skip & (cur == skip_col))).float()
         else:
             for k in range(R):
                 pk = pulse_times[:, k:k + 1]                            # (n, 1)
                 win = (tg >= pk) & (tg < pk + pulse) & (cur == k)       # clipped to segment k
-                win = win & (k < cap).unsqueeze(1)
+                win = win & (k < cap).unsqueeze(1) & ~(has_skip & (skip_col == k))
                 go = torch.maximum(go, win.float())
         inp[:, :, 3 * self.n_slots] = go
 
         # ---- desired trajectory ------------------------------------------------------------
-        # index of the target the hand should hold/reach: cur during the sequence, frozen at
-        # cap-1 on aborts, R-1 during the final hold; start posture before the first pulse
-        # and on trial no-go.
-        didx = torch.minimum(cur, (cap - 1).clamp(min=0).unsqueeze(1)).clamp(max=R - 1)
+        # target the hand should be at: `cur` normally; during a skipped reach it stays at the
+        # previously captured target (so that segment is just a longer dwell), and on a trial
+        # no-go it never leaves the start posture.
+        didx = torch.where(has_skip & (cur == skip_col), (skip_col - 1).clamp(min=0), cur)
+        didx = torch.minimum(didx, (cap - 1).clamp(min=0).unsqueeze(1)).clamp(min=0, max=R - 1)
         des_x = tx.gather(1, didx)
         des_y = ty.gather(1, didx)
         moved = (tg >= t_go) & (cap > 0).unsqueeze(1)                   # (n, T)
@@ -611,15 +623,25 @@ class HorizonSequence:
                               start.unsqueeze(1))
 
         if self.desired_profile == 'min_jerk':
-            # overwrite each cued segment with a min-jerk ramp prev -> target k, then hold
+            # overwrite each cued segment with a min-jerk ramp prev -> target k, then hold. A
+            # skipped reach gets no ramp (it is a hold), and the reach after it starts from the
+            # target held during the skip, not from the skipped target.
             for k in range(R):
                 pk = pulse_times[:, k:k + 1]                            # segment start (n, 1)
                 seg_len = (bounds[:, k:k + 1] - pk).clamp(min=1)
                 mj = seg_len.clamp(max=self.mj_move_steps).float()
                 s = _min_jerk_s((tg - pk).float() / mj)                 # (n, T)
-                prev = start if k == 0 else targets[:, k - 1]           # (n, 2)
+                if k == 0:
+                    prev = start                                        # (n, 2)
+                else:
+                    # normally target k-1; if k-1 was skipped the hand is still at target k-2
+                    pidx = torch.full((n,), k - 1, dtype=torch.long, device=dev)
+                    pidx = torch.where((skip == k - 1) & (skip >= 0),
+                                       pidx - 1, pidx).clamp(min=0)
+                    prev = targets[torch.arange(n, device=dev), pidx]    # (n, 2)
                 ramp = prev.unsqueeze(1) + (targets[:, k] - prev).unsqueeze(1) * s.unsqueeze(-1)
-                mask = (cur == k) & moved & (k < cap).unsqueeze(1)
+                mask = ((cur == k) & moved & (k < cap).unsqueeze(1)
+                        & ~(has_skip & (skip_col == k)))                # no ramp on a skipped reach
                 desired = torch.where(mask.unsqueeze(-1), ramp, desired)
 
         # per-trial epoch boundaries (step indices); not used in training, handy for analysis
