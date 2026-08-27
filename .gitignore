@@ -2,3 +2,8 @@ __pycache__/
 experiments/
 wandb/
 .DS_Store
+experiments_multitask/
+figs/
+latent_analysis/
+*.mp4
+notebooks/

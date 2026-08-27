@@ -39,7 +39,9 @@ the trained task's parameters. Timing keys are interpreted by whichever task the
 """
 
 import argparse
+import contextlib
 import glob
+import io
 import json
 import os
 
@@ -403,36 +405,6 @@ def spec_point2point(cfg, effector, points_xy=None):
 
 # name -> builder(cfg, effector). A builder may return None when the spec doesn't apply to the
 # trained task (e.g. reach specs on horizon_sequence and vice versa); such specs are skipped.
-def spec_sequence(cfg, effector):
-    """One fixed target sequence run at horizon 1, 2, and 3 (3 trials), so the same movement
-    can be compared across planning horizons. Deterministic (seeded) start + targets sampled
-    from the trained workspace; timing at each range's midpoint via the task's own defaults.
-    Only applies to horizon_sequence models."""
-    if cfg.get("task") != "horizon_sequence":
-        return None
-    R = int(cfg.get("n_reaches") or 7)
-    g = torch.Generator().manual_seed(0)
-    if effector.name == "point_mass":
-        lo, hi = effector.pos_range
-        pts = torch.rand(R + 1, 2, generator=g) * (hi - lo) + lo
-        start, targets = pts[0], pts[1:]
-        start_space = "cartesian"
-        start_val = start.tolist()
-    else:
-        sho = torch.rand(R + 1, 1, generator=g) * (effector.sho_range[1] - effector.sho_range[0]) \
-              + effector.sho_range[0]
-        elb = torch.rand(R + 1, 1, generator=g) * (effector.elb_range[1] - effector.elb_range[0]) \
-              + effector.elb_range[0]
-        joints = torch.cat([sho, elb], dim=1)
-        targets = effector.joint_to_cart(joints[1:].to(effector.device)).cpu()
-        start_space = "joint"
-        start_val = joints[0].tolist()
-    spec = {"start_space": start_space, "target_space": "cartesian",
-            "start": start_val, "targets": targets.tolist(),
-            "horizon": [1, 2, 3]}                          # same sequence, three horizons
-    return _apply_task_timing(cfg, spec)
-
-
 def spec_hold(cfg, effector, n_dirs=8):
     """Hold-posture bump set: hold at the workspace-center posture while a fixed-magnitude bump
     is delivered in each of n_dirs evenly-spaced directions. Onset/duration at the range
@@ -494,9 +466,238 @@ def spec_pacman(cfg, effector):
     return _apply_task_timing(cfg, spec)
 
 
+# ------------------------------------------------------- grid-based sequence test sets
+# A hexagonal grid of candidate targets (the layout used in the monkey experiments): 45 points,
+# uniform nearest-neighbour spacing, so a "neighbour walk" over the grid gives sequences whose
+# consecutive reaches are always the same distance apart and which span the workspace.
+HEX_GRID_CM = np.array(
+    [[x, y] for y in np.arange(-15.0, 15.01, 2.5)
+     for x in ([-8.66, 0.0, 8.66] if round(y / 2.5) % 2 == 0 else [-12.99, -4.33, 4.33, 12.99])],
+    dtype=np.float32)
+
+
+def load_grid(path=None):
+    """Grid of candidate targets in metres, centred on the origin. Defaults to the built-in
+    hexagonal layout; `path` loads a two-column file in centimetres (e.g. Grid.txt)."""
+    G = np.loadtxt(path, dtype=np.float32) if path else HEX_GRID_CM.copy()
+    G = G / 100.0
+    return G - G.mean(0)
+
+
+_GRID_CACHE = {}
+
+
+def fit_grid_to_workspace(effector, grid=None, scale=None, center=None, verbose=True,
+                          angles=(0, 15, 30, 45), rotate=True):
+    """Place the grid inside this effector's reachable workspace, covering as much of it as possible.
+
+    The published grid was positioned for one particular arm; joint limits differ between
+    effectors, so by default the grid is centred on this effector's own sampling workspace and then
+    rotated / scaled / offset until every point is reachable, keeping the placement that spans the
+    largest area. Rotating is free: a rotated triangular lattice is still a triangular lattice with
+    the same uniform neighbour spacing, and it fits the arm's crescent-shaped workspace much better
+    than the axis-aligned one. Pass `scale` / `center` to override, or rotate=False to disable.
+    Returns (grid_xy (n,2), scale). Results are cached per effector configuration.
+    """
+    G0 = load_grid() if grid is None else np.asarray(grid, dtype=np.float32)
+    key = (effector.name, tuple(np.round(np.asarray(effector.config_range[0]), 4)),
+           tuple(np.round(np.asarray(effector.config_range[1]), 4)),
+           None if scale is None else float(scale),
+           None if center is None else tuple(np.round(np.asarray(center), 4)),
+           bool(rotate), G0.shape[0])
+    if key in _GRID_CACHE:
+        return _GRID_CACHE[key]
+
+    if center is None:
+        pts = effector.joint_to_cart(effector.sample_joint(4000)).detach().cpu().numpy()
+        center = pts.mean(0)
+    center = np.asarray(center, dtype=np.float32)
+
+    def n_valid(G):
+        xy = torch.as_tensor(G, dtype=torch.float32, device=effector.device)
+        with contextlib.redirect_stdout(io.StringIO()):     # probing placements: ignore ik chatter
+            th = effector.cartesian_to_joint(xy)
+            ok = (effector.joint_to_cart(th) - xy).norm(dim=-1) < 1e-3
+        if hasattr(effector, 'sho_range'):                  # arms: also stay in the sampling range
+            ok &= ((th[:, 0] >= effector.sho_range[0]) & (th[:, 0] <= effector.sho_range[1])
+                   & (th[:, 1] >= effector.elb_range[0]) & (th[:, 1] <= effector.elb_range[1]))
+        return int(ok.sum())
+
+    if scale is not None:
+        out = ((G0 * scale + center).astype(np.float32), scale)
+        _GRID_CACHE[key] = out
+        return out
+
+    # search rotation x scale x offset, keeping the placement that spans the largest area. A
+    # rotated triangular lattice is still a triangular lattice, so neighbour spacing is unchanged.
+    G0c = G0 - G0.mean(0)
+    best = None                                             # (area, scale, G)
+    for ang in (angles if rotate else (0,)):
+        c, s_ = np.cos(np.radians(ang)), np.sin(np.radians(ang))
+        GR = G0c @ np.array([[c, -s_], [s_, c]], dtype=np.float32).T
+        span = np.abs(GR).max(0)
+        offsets = [np.array([dx, dy], dtype=np.float32)
+                   for dy in np.linspace(-0.6, 0.6, 7) * span[1]
+                   for dx in np.linspace(-0.6, 0.6, 7) * span[0]]
+        offsets.sort(key=lambda o: float(np.hypot(*o)))     # prefer staying near the centroid
+        for sc in np.arange(2.0, 0.24, -0.05):              # largest first: stop at the first fit
+            hit = None
+            for off in offsets:
+                G = GR * sc + center + off
+                if n_valid(G) == len(G0):
+                    hit = G
+                    break
+            if hit is not None:
+                area = float(np.ptp(hit[:, 0]) * np.ptp(hit[:, 1]))
+                if best is None or area > best[0]:
+                    best = (area, float(sc), hit, ang)
+                break
+    if best is None:
+        raise RuntimeError("could not fit the target grid inside this effector's workspace")
+    area, sc, G, ang = best
+    if verbose:
+        DD = np.linalg.norm(G[:, None, :] - G[None, :, :], axis=-1)
+        np.fill_diagonal(DD, np.inf)
+        print(f"    grid: {len(G0)} points, scale {sc:.2f}, rotation {ang}deg, neighbour spacing "
+              f"{DD.min() * 100:.1f} cm, span {np.ptp(G[:, 0]) * 100:.0f}x{np.ptp(G[:, 1]) * 100:.0f} cm "
+              f"(all reachable)")
+    out = (G.astype(np.float32), sc)
+    _GRID_CACHE[key] = out
+    return out
+
+
+def grid_neighbours(G, tol=1e-3):
+    """Adjacency list: for each grid point, the indices at the (uniform) nearest-neighbour
+    distance. On a hexagonal grid this gives up to 6 neighbours per point."""
+    D = np.linalg.norm(G[:, None, :] - G[None, :, :], axis=-1)
+    np.fill_diagonal(D, np.inf)
+    d0 = D.min()
+    return [np.flatnonzero(D[i] <= d0 * (1 + tol)) for i in range(len(G))]
+
+
+def _walk(nbrs, rng, n_steps, start=None, avoid_immediate_backtrack=True):
+    """Random walk of `n_steps` moves over the grid; consecutive points are always neighbours."""
+    cur = int(rng.integers(len(nbrs))) if start is None else int(start)
+    path = [cur]
+    for _ in range(n_steps):
+        cand = nbrs[cur]
+        if avoid_immediate_backtrack and len(path) > 1:
+            trimmed = cand[cand != path[-2]]
+            if len(trimmed):
+                cand = trimmed
+        cur = int(rng.choice(cand))
+        path.append(cur)
+    return path
+
+
+def grid_random_sequences(G, n_reaches, n_per_horizon=100, horizons=(1, 2, 3), seed=0):
+    """`n_per_horizon` random neighbour-walk sequences for each horizon (default 3 x 100 = 300).
+
+    Each trial is a walk over the grid: the start posture and every reach are grid points, and
+    consecutive reaches are always neighbours. Over the whole set the walks span the grid, so the
+    test batch covers the workspace rather than a handful of directions.
+    Returns (start_xy (N,2), targets_xy (N, n_reaches, 2), horizon (N,)).
+    """
+    rng = np.random.default_rng(seed)
+    nbrs = grid_neighbours(G)
+    starts, targets, hor = [], [], []
+    for h in horizons:
+        for _ in range(n_per_horizon):
+            p = _walk(nbrs, rng, n_reaches)                 # start + n_reaches points
+            starts.append(G[p[0]]); targets.append(G[p[1:]]); hor.append(h)
+    return (np.stack(starts).astype(np.float32), np.stack(targets).astype(np.float32),
+            np.array(hor, dtype=np.int64))
+
+
+def grid_segment_sequences(G, n_reaches=7, seg_at=(4, 5, 6), n_branch=2, n_per_horizon=100,
+                           horizons=(1, 2, 3), seed=0, hub=None):
+    """Sequences sharing a repeated middle segment, with random reaches around it.
+
+    The middle reach of the segment (`seg_at[1]`, reach 5 by default) is a single fixed 'hub' grid
+    point common to every variant. The reach into it (`seg_at[0]`) has `n_branch` possible grid
+    points and the reach out of it (`seg_at[2]`) has `n_branch` others, all of them neighbours of
+    the hub -- so every in/out combination is a valid neighbour walk and there are n_branch**2
+    (default 4) distinct middle segments. A full 2x2x2 cross-product is geometrically impossible on
+    this lattice without walking back onto itself, which is why the middle reach is shared.
+
+    Reaches before the segment are a random walk generated BACKWARDS from the segment start (so the
+    prefix always connects), and reaches after it are a forward random walk. Every (variant,
+    horizon) pair recurs many times with different surroundings, which is what lets you ask whether
+    the same middle segment is executed the same way in different contexts.
+
+    Returns (start_xy, targets_xy, horizon, seg_id); seg_id labels the middle variant (0..n_branch**2-1).
+    """
+    rng = np.random.default_rng(seed)
+    nbrs = grid_neighbours(G)
+    assert tuple(seg_at) == tuple(range(seg_at[0], seg_at[0] + 3)), "seg_at must be 3 consecutive reaches"
+    assert seg_at[-1] <= n_reaches, "segment must fit inside the sequence"
+    i0 = seg_at[0] - 1                                      # 0-based index of the first segment reach
+
+    # hub: a well-connected point near the centre, so both branch sets stay inside the workspace
+    order = np.argsort(np.linalg.norm(G - G.mean(0), axis=1))
+    hub = int(next(i for i in order if len(nbrs[i]) >= 2 * n_branch)) if hub is None else int(hub)
+    hub_nbrs = list(rng.permutation(nbrs[hub]))
+    ins = [int(x) for x in hub_nbrs[:n_branch]]             # options for the reach INTO the hub
+    outs = [int(x) for x in hub_nbrs[n_branch:2 * n_branch]]  # options for the reach OUT of it
+    variants = [(a, hub, b) for a in ins for b in outs]     # n_branch**2 middle segments
+
+    starts, targets, hor, sid = [], [], [], []
+    per_variant = max(1, n_per_horizon // len(variants))
+    for h in horizons:
+        for s_i, seg in enumerate(variants):
+            for _ in range(per_variant):
+                # prefix walked backwards from the segment start: path[0] is the start posture and
+                # path[1:] the reaches, so there are i0 + 1 points before the segment
+                back = _walk(nbrs, rng, i0 + 1, start=seg[0])
+                pre = back[1:][::-1]
+                post = _walk(nbrs, rng, n_reaches - seg_at[-1], start=seg[-1])[1:]
+                path = pre + list(seg) + post               # start + n_reaches points
+                starts.append(G[path[0]])
+                targets.append(G[path[1:n_reaches + 1]])
+                hor.append(h); sid.append(s_i)
+    return (np.stack(starts).astype(np.float32), np.stack(targets).astype(np.float32),
+            np.array(hor, dtype=np.int64), np.array(sid, dtype=np.int64))
+
+
+def spec_sequence_grid(cfg, effector, n_per_horizon=100):
+    """300 random grid-walk sequences (100 per horizon) spanning the workspace. Every reach is a
+    grid point and consecutive reaches are neighbours, so reach distance is constant throughout and
+    only direction and context vary. Only applies to horizon_sequence models."""
+    if cfg.get("task") != "horizon_sequence":
+        return None
+    R = int(cfg.get("n_reaches") or 7)
+    G, _ = fit_grid_to_workspace(effector)
+    start, targets, hor = grid_random_sequences(G, R, n_per_horizon=n_per_horizon,
+                                                seed=cfg.get("seed", 0))
+    spec = {"start_space": "cartesian", "target_space": "cartesian",
+            "start": start.tolist(), "targets": targets.tolist(), "horizon": hor.tolist()}
+    return _apply_task_timing(cfg, spec)
+
+
+def spec_sequence_segment(cfg, effector, n_per_horizon=100):
+    """Sequences sharing a repeated middle segment (reaches 4-6 of a 7-reach sequence by default),
+    with random reaches before and after, run at every horizon. Reach 5 is a fixed hub shared by
+    every variant; reach 4 has two options into it and reach 6 two options out of it, giving 4
+    distinct middle segments x 3 horizons, each recurring in many different surrounding contexts.
+    Only applies to horizon_sequence models."""
+    if cfg.get("task") != "horizon_sequence":
+        return None
+    R = int(cfg.get("n_reaches") or 7)
+    if R < 6:
+        print(f"      (segment spec needs n_reaches >= 6; this run has {R})")
+        return None
+    G, _ = fit_grid_to_workspace(effector)
+    start, targets, hor, sid = grid_segment_sequences(G, n_reaches=R, n_per_horizon=n_per_horizon,
+                                                      seed=cfg.get("seed", 0))
+    spec = {"start_space": "cartesian", "target_space": "cartesian",
+            "start": start.tolist(), "targets": targets.tolist(), "horizon": hor.tolist(),
+            "segment_id": sid.tolist()}                     # carried through for grouping
+    return _apply_task_timing(cfg, spec)
+
+
 BUILTIN_SPECS = {"center_out": spec_center_out, "point2point": spec_point2point,
-                 "sequence": spec_sequence, "hold": spec_hold, "pursuit": spec_pursuit,
-                 "pacman": spec_pacman}
+                 "hold": spec_hold, "pursuit": spec_pursuit, "pacman": spec_pacman,
+                 "sequence": spec_sequence_grid, "sequence_segment": spec_sequence_segment}
 
 
 # ----------------------------------------------------------------------------- run one folder
@@ -542,6 +743,11 @@ def _run_one_spec(folder, name, spec, eff, controller, task, cfg,
         data["perturbation"] = pert.detach().cpu().numpy()
     for k, v in ts.items():
         data[f"ts_{k}"] = v.detach().cpu().numpy()
+    # per-trial labels carried on the spec itself (e.g. segment_id / horizon for the grid sets),
+    # so downstream analysis can group trials without re-deriving them
+    for k in ("segment_id", "horizon"):
+        if isinstance(spec, dict) and k in spec:
+            data[k] = np.asarray(spec[k])
     data['module_size'] = cfg['module_size']
     np.savez(os.path.join(out_dir, "states.npz"), **data)
 
@@ -578,7 +784,7 @@ def main():
     ap.add_argument("--spec", action="append", default=None,
                     help="path to a user JSON spec; repeatable. Each is named by its filename "
                          "and run in addition to the built-in specs.")
-    ap.add_argument("--builtin", default="center_out,point2point,sequence,hold,pursuit,pacman",
+    ap.add_argument("--builtin", default="center_out,point2point,sequence,sequence_segment,hold,pursuit,pacman",
                     help="comma-separated built-in specs to run "
                          f"(choices: {', '.join(BUILTIN_SPECS)}; pass 'none' to skip them)")
     ap.add_argument("--device", default="cpu")
