@@ -338,14 +338,39 @@ POINT2POINT_XY = [[-0.36,  0.42], [-0.054, 0.42], [-0.36,  0.21],
 
 
 def _apply_task_timing(cfg, spec):
-    """Fill in timing keys to roughly match the task the network trained on (in place)."""
+    """Fill in timing keys (in place) to match the task the network trained on.
+
+    Defaults come from the run's own saved timing ranges (their midpoint), so a model trained with,
+    say, a 700-1000 ms dwell is tested at 850 ms rather than some fixed constant. Anything passed
+    via --init-ms / --delay-ms / --dwell-ms / --move-ms / --final-ms (carried on cfg['_timing_ms'])
+    overrides that, which is how you pin every test trial to one exact duration.
+    """
+    dt = float(cfg.get("dt", 0.01) or 0.01)
+    ov = cfg.get("_timing_ms") or {}
+
+    def steps(ms):
+        return max(1, int(round(float(ms) / 1000.0 / dt)))
+
+    def pick(key, range_key, fallback_ms, scalar_key=None):
+        """steps for `key`: CLI override, else the trained range midpoint, else `fallback_ms`."""
+        if ov.get(key) is not None:
+            return steps(ov[key])
+        rng = cfg.get(range_key)
+        if rng is not None:
+            return steps(0.5 * (float(rng[0]) + float(rng[1])))
+        if scalar_key is not None and cfg.get(scalar_key) is not None:
+            return steps(cfg[scalar_key])
+        return steps(fallback_ms)
+
     if cfg.get("task") == "delayed_reach":
         total = int(cfg.get("steps", 100) or 100)
         spec.setdefault("steps", total)
         spec.setdefault("go_time", min(30, total // 3))          # fixed (deterministic) go onset
     elif cfg.get("task") == "horizon_sequence":
-        spec.setdefault("init_steps", 40);  spec.setdefault("delay_steps", 50)
-        spec.setdefault("dwell_steps", 50); spec.setdefault("final_steps", 40)
+        spec.setdefault("init_steps",  pick("init",  "init_range_ms",  500))
+        spec.setdefault("delay_steps", pick("delay", "delay_range_ms", 500))
+        spec.setdefault("dwell_steps", pick("dwell", "dwell_range_ms", 500))
+        spec.setdefault("final_steps", pick("final", "final_range_ms", 500))
     elif cfg.get("task") in ("hold_posture_pulse", "hold_posture_ramp"):
         pass                                                    # timing sampled by the task itself
     elif cfg.get("task") == "pursuit":
@@ -353,8 +378,10 @@ def _apply_task_timing(cfg, spec):
     elif cfg.get("task") == "pacman":
         pass                                                    # timing/conditions handled by the task
     else:                                                        # delayed_reach_posture
-        spec.setdefault("init_steps", 40);  spec.setdefault("delay_steps", 50)
-        spec.setdefault("move_steps", 120); spec.setdefault("final_steps", 40)
+        spec.setdefault("init_steps",  pick("init",  "init_range_ms",  500))
+        spec.setdefault("delay_steps", pick("delay", "delay_range_ms", 500))
+        spec.setdefault("move_steps",  pick("move",  None, 1200, scalar_key="move_ms"))
+        spec.setdefault("final_steps", pick("final", "final_range_ms", 500))
         spec.setdefault("final_input", cfg.get("final_input") or "null")
     return spec
 
@@ -758,13 +785,18 @@ def _run_one_spec(folder, name, spec, eff, controller, task, cfg,
     return err
 
 
-def run_folder(folder, named_specs, device, obs_noise, neural_noise, num_plot, seed):
+def run_folder(folder, named_specs, device, obs_noise, neural_noise, num_plot, seed,
+               timing_ms=None):
     """Evaluate every (name, spec) in `named_specs` on the model in `folder`.
 
     Each entry's spec is either a flat dict (user spec) or a callable builder(cfg, effector)
     (built-in spec). Returns {name: final_endpoint_error_cm}.
     """
     eff, controller, task, cfg = load_experiment(folder, device)
+    # explicit timing overrides (ms) are carried on cfg so the spec builders can honour them
+    cfg["_timing_ms"] = {k: v for k, v in (timing_ms or {}).items() if v is not None}
+    if cfg["_timing_ms"]:
+        print(f"  timing override (ms): {cfg['_timing_ms']}")
     print(f"  {os.path.basename(folder)}: {cfg['effector']}/{cfg['arch']}")
     results = {}
     for name, spec in named_specs:
@@ -794,6 +826,17 @@ def main():
                     help="std of hidden-state noise during testing (default 0 = clean)")
     ap.add_argument("--num-plot", type=int, default=5, help="trials shown in the diagnostics figure")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--init-ms",  type=float, default=None,
+                    help="override the initial-hold duration of every test trial (ms)")
+    ap.add_argument("--delay-ms", type=float, default=None,
+                    help="override the delay duration of every test trial (ms)")
+    ap.add_argument("--dwell-ms", type=float, default=None,
+                    help="horizon_sequence: fix the per-reach dwell of every test trial (ms). "
+                         "Default = midpoint of the range the model trained on")
+    ap.add_argument("--move-ms",  type=float, default=None,
+                    help="delayed_reach_posture: override the movement window (ms)")
+    ap.add_argument("--final-ms", type=float, default=None,
+                    help="override the final-hold duration of every test trial (ms)")
     ap.add_argument("--only", default=None,
                     help="substring filter: only run folders whose name contains this")
     args = ap.parse_args()
@@ -836,7 +879,10 @@ def main():
             print('--------------------------------')
             print(folder)
             run_folder(folder, named_specs, torch.device(args.device),
-                       args.obs_noise, args.neural_noise, args.num_plot, args.seed)
+                       args.obs_noise, args.neural_noise, args.num_plot, args.seed,
+                       timing_ms={'init': args.init_ms, 'delay': args.delay_ms,
+                                  'dwell': args.dwell_ms, 'move': args.move_ms,
+                                  'final': args.final_ms})
         except Exception as e:
             print(f"  {os.path.basename(folder)}: SKIPPED ({type(e).__name__}: {e})")
 
