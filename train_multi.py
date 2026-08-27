@@ -91,11 +91,17 @@ def task_effector(name, effectors):
 
 
 # ----------------------------------------------------------------------------- loss / metric
-def compute_loss(args, states, desired, is_force):
+def compute_loss(args, states, desired, is_force, ts=None):
     """Same loss as train.py: force-tracking for the isometric task, position otherwise. Every term
     is averaged over time, so tasks with longer trials do not get more weight."""
     tracked = states.force if is_force else states.pos
-    loss_pos = (tracked - desired).abs().sum(-1).mean()
+    _err = (tracked - desired).abs().sum(-1)
+    _lm = ts.get('loss_mask') if isinstance(ts, dict) else None          # see train.py
+    if _lm is None:
+        loss_pos = _err.mean()
+    else:
+        _lm = _lm.to(_err.device).float()
+        loss_pos = (_err * _lm).sum() / _lm.sum().clamp(min=1.0)
     _jerk = (states.pos[:, 3:] - 3 * states.pos[:, 2:-1]
              + 3 * states.pos[:, 1:-2] - states.pos[:, :-3])
     loss_jerk = _jerk.pow(2).sum(-1).mean()
@@ -148,7 +154,7 @@ def evaluate(controller, tasks, eval_batches, effectors, args):
             theta0, inp, desired, pert, ts = eval_batches[name]
             st = eff.rollout(controller, theta0, inp, pert)
             res[name] = {'err': task_error(st, desired, is_force),
-                         'loss': compute_loss(args, st, desired, is_force).item()}
+                         'loss': compute_loss(args, st, desired, is_force, ts).item()}
     controller.train()
     return res
 
@@ -166,7 +172,7 @@ def finetune_probe(controller, task, name, effectors, args, eval_batch):
         theta0, inp, desired, pert, ts = task.make_batch(args.finetune_batch)
         st = eff.rollout(probe, theta0, inp, pert, obs_noise=args.obs_noise,
                          neural_noise=args.neural_noise, action_noise=args.action_noise)
-        loss = compute_loss(args, st, desired, is_force)
+        loss = compute_loss(args, st, desired, is_force, ts)
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(probe.parameters(), max_norm=1.0)
         opt.step()
@@ -199,7 +205,7 @@ def main():
     # training
     p.add_argument("--n-batch", type=int, default=600, help="optimizer steps (each = one round-robin sweep)")
     p.add_argument("--batch-size", type=int, default=64, help="trials per task per step")
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--seed", type=int, default=0)
     # eval / probes
     p.add_argument("--eval-every", type=int, default=25)
@@ -208,7 +214,7 @@ def main():
                    help="if >0, at each eval also fine-tune a copy on each non-trained task for "
                         "this many steps and report the resulting error (adaptation speed)")
     p.add_argument("--finetune-batch", type=int, default=32)
-    p.add_argument("--finetune-lr", type=float, default=1e-4)
+    p.add_argument("--finetune-lr", type=float, default=1e-3)
     # shared task knobs
     p.add_argument("--n-reaches", type=int, default=4, help="horizon_sequence length")
     p.add_argument("--exec-ms", type=int, default=2000, help="pursuit/pacman profile duration")
@@ -225,9 +231,9 @@ def main():
     p.add_argument("--w-loss-hidden", type=float, default=3e-4)
     p.add_argument("--w-loss-hidden-diff", type=float, default=3e-2)
     # noise
-    p.add_argument("--obs-noise", type=float, default=0.001)
-    p.add_argument("--neural-noise", type=float, default=0.001)
-    p.add_argument("--action-noise", type=float, default=0.0001)
+    p.add_argument("--obs-noise", type=float, default=0.1)
+    p.add_argument("--neural-noise", type=float, default=0.05)
+    p.add_argument("--action-noise", type=float, default=0.0)
     p.add_argument("--track", action="store_true", help="log to wandb")
     p.add_argument("--wandb-project", default="reach-lab-multitask")
     args = p.parse_args()
@@ -316,7 +322,7 @@ def main():
             theta0, inp, desired, pert, ts = task.make_batch(args.batch_size)
             st = eff.rollout(controller, theta0, inp, pert, obs_noise=args.obs_noise,
                              neural_noise=args.neural_noise, action_noise=args.action_noise)
-            loss = compute_loss(args, st, desired, is_force)
+            loss = compute_loss(args, st, desired, is_force, ts)
             # scale so the *sum* over tasks is the mean task loss (keeps grad magnitude comparable
             # to single-task training regardless of how many tasks are in the mix)
             (weights[name] * loss / max(1e-8, sum(weights.values()))).backward()

@@ -437,8 +437,14 @@ class HorizonSequence:
                  horizon_probs=(1/3, 1/3, 1/3),
                  prob_no_go=0.15, prob_no_go_reach=0.0,
                  desired_profile='step', mj_move_steps=30, go_pulse_ms=150,
+                 blind_mask_ms=None,
                  perturb_prob=0.0, perturb_mag=0.0, perturb_dur_ms=100, **kwargs):
         self.effector = effector
+        # window after an *unpreviewed* go pulse that is excluded from the position loss, because
+        # the target has not reached the controller yet (sensory delay). Defaults to the effector's
+        # visual delay; set 0 to disable and recover the old behaviour.
+        self.blind_mask_steps = (effector.vis_d if blind_mask_ms is None
+                                 else max(0, round(blind_mask_ms / 1000 / effector.dt)))
         self.n_reaches = int(n_reaches)
         hp = torch.as_tensor(horizon_probs, dtype=torch.float32)
         assert hp.numel() == self.n_slots and abs(hp.sum().item() - 1.0) < 1e-4, \
@@ -644,6 +650,30 @@ class HorizonSequence:
                         & ~(has_skip & (skip_col == k)))                # no ramp on a skipped reach
                 desired = torch.where(mask.unsqueeze(-1), ramp, desired)
 
+        # ---- sensory-blind loss mask ---------------------------------------------------------
+        # `desired` jumps to the new target at the capture, but the whole instruction stream
+        # (target AND go cue) reaches the controller one visual delay later, so over that window
+        # the loss demands movement toward a target that cannot yet have been perceived. The
+        # cheapest way to satisfy it is to guess the average direction and correct -- exactly the
+        # spurious pre-movement seen at horizon 1. We therefore exclude that window from the loss
+        # for reaches whose target was NOT already visible before the pulse. Nothing pushes the
+        # network to move there any more, and the effort penalties make holding still cheapest, so
+        # a reaction time emerges rather than being prescribed. Previewed reaches (all of H2/H3,
+        # and the first reach of every trial, visible throughout the delay) are untouched, so they
+        # can still launch immediately.
+        loss_mask = torch.ones(n, T, dtype=torch.bool, device=dev)
+        if self.blind_mask_steps > 0:
+            b = int(self.blind_mask_steps)
+            ks = torch.arange(R, device=dev).view(1, R)                 # (1, R)
+            # target k first enters a lit slot during segment max(0, k - h + 1); it is unpreviewed
+            # exactly when that is its own segment (horizon 1) and it is not the first reach.
+            unpreviewed = (((ks - horizon.view(n, 1) + 1).clamp(min=0) == ks) & (ks > 0)
+                           & (ks < cap.view(n, 1)))
+            unpreviewed = unpreviewed & ~(has_skip & (skip_col == ks))
+            for k in range(R):
+                pk = pulse_times[:, k:k + 1]                            # (n, 1)
+                loss_mask &= ~((tg >= pk) & (tg < pk + b) & unpreviewed[:, k:k + 1])
+
         # per-trial epoch boundaries (step indices); not used in training, handy for analysis
         timestamps = {
             'delay_start':   t_delay.squeeze(-1).long(),                # targets appear
@@ -654,6 +684,7 @@ class HorizonSequence:
             'horizon':       horizon.long(),
             'is_no_go':      nogo,
             'no_go_reach':   no_go_reach.long(),
+            'loss_mask':     loss_mask,       # False where the target cannot yet be perceived
         }
         return theta0, inp, desired, perturbation, timestamps
 

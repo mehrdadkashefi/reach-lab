@@ -285,7 +285,15 @@ for i in tqdm(range(args.n_batch)):
     # target FORCE for the force task and a target POSITION otherwise; states.force / states.pos
     # is the matching generated quantity.
     tracked = states.force if IS_FORCE_TASK else states.pos
-    loss_pos = (tracked - desired).abs().sum(-1).mean()
+    # a task may supply a per-timestep mask marking steps that should not be scored -- e.g. the
+    # window after an unpreviewed go cue, before the target can physically have been perceived.
+    _err = (tracked - desired).abs().sum(-1)                               # (n, T)
+    _lm = ts.get('loss_mask') if isinstance(ts, dict) else None
+    if _lm is None:
+        loss_pos = _err.mean()
+    else:
+        _lm = _lm.to(_err.device).float()
+        loss_pos = (_err * _lm).sum() / _lm.sum().clamp(min=1.0)
     # jerk loss is a *movement*-smoothness penalty, always on position (frozen -> 0 for the
     # isometric force task, whose force profile is meant to have sharp features and must NOT be
     # penalised by the position-tuned jerk weight).
