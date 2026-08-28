@@ -437,14 +437,22 @@ class HorizonSequence:
                  horizon_probs=(1/3, 1/3, 1/3),
                  prob_no_go=0.15, prob_no_go_reach=0.0,
                  desired_profile='step', mj_move_steps=30, go_pulse_ms=150,
-                 blind_mask_ms=None,
+                 blind_mode='delay', blind_ms=None,
                  perturb_prob=0.0, perturb_mag=0.0, perturb_dur_ms=100, **kwargs):
         self.effector = effector
-        # window after an *unpreviewed* go pulse that is excluded from the position loss, because
-        # the target has not reached the controller yet (sensory delay). Defaults to the effector's
-        # visual delay; set 0 to disable and recover the old behaviour.
-        self.blind_mask_steps = (effector.vis_d if blind_mask_ms is None
-                                 else max(0, round(blind_mask_ms / 1000 / effector.dt)))
+        # How to handle the window after an *unpreviewed* go cue, during which the target has not
+        # reached the controller yet (sensory delay):
+        #   'delay' : the desired holds at the previous target across the window, so waiting is
+        #             optimal and pre-moving is penalised  (recommended)
+        #   'mask'  : the window is dropped from the loss -- removes the cost of guessing but not
+        #             its benefit, so the network may still pre-move
+        #   'none'  : original behaviour, desired jumps at the capture
+        assert blind_mode in ('delay', 'mask', 'none')
+        self.blind_mode = blind_mode
+        self.blind_steps = (effector.vis_d if blind_ms is None
+                            else max(0, round(blind_ms / 1000 / effector.dt)))
+        if blind_mode == 'none':
+            self.blind_steps = 0
         self.n_reaches = int(n_reaches)
         hp = torch.as_tensor(horizon_probs, dtype=torch.float32)
         assert hp.numel() == self.n_slots and abs(hp.sum().item() - 1.0) < 1e-4, \
@@ -615,15 +623,31 @@ class HorizonSequence:
                 go = torch.maximum(go, win.float())
         inp[:, :, 3 * self.n_slots] = go
 
+        # ---- which reaches are unpreviewed? ---------------------------------------------------
+        # Target k first enters a lit slot during segment max(0, k - h + 1); it is unpreviewed
+        # exactly when that is its own segment (horizon 1) and it is not the first reach (whose
+        # target is visible throughout the delay period).
+        ks = torch.arange(R, device=dev).view(1, R)                     # (1, R)
+        unpreviewed = (((ks - horizon.view(n, 1) + 1).clamp(min=0) == ks) & (ks > 0)
+                       & (ks < cap.view(n, 1)) & ~(has_skip & (skip_col == ks)))
+
         # ---- desired trajectory ------------------------------------------------------------
-        # target the hand should be at: `cur` normally; during a skipped reach it stays at the
-        # previously captured target (so that segment is just a longer dwell), and on a trial
-        # no-go it never leaves the start posture.
-        didx = torch.where(has_skip & (cur == skip_col), (skip_col - 1).clamp(min=0), cur)
+        # The go cue and the new target reach the controller one visual delay after the capture,
+        # so during that window an unpreviewed reach CANNOT know where to go. With
+        # blind_mode='delay' the desired stays at the previous target across the window and only
+        # then switches, which makes waiting optimal: drifting toward the average target is now
+        # actively penalised. (Merely masking the window -- blind_mode='mask' -- removes the
+        # in-window cost of guessing but not its benefit, since a hand that has drifted centre-ward
+        # begins the scored part of the reach closer to the average target.)
+        onsets = pulse_times + (self.blind_steps * unpreviewed.long()
+                                if self.blind_mode == 'delay' else 0)   # (n, R)
+        cur_des = (tg.unsqueeze(-1) >= onsets.unsqueeze(1)).sum(-1)     # (n, T), 0 before reach 0
+        didx = (cur_des - 1).clamp(min=0)
+        didx = torch.where(has_skip & (didx == skip_col), (skip_col - 1).clamp(min=0), didx)
         didx = torch.minimum(didx, (cap - 1).clamp(min=0).unsqueeze(1)).clamp(min=0, max=R - 1)
         des_x = tx.gather(1, didx)
         des_y = ty.gather(1, didx)
-        moved = (tg >= t_go) & (cap > 0).unsqueeze(1)                   # (n, T)
+        moved = (cur_des >= 1) & (cap > 0).unsqueeze(1)                  # (n, T)
         desired = torch.where(moved.unsqueeze(-1),
                               torch.stack([des_x, des_y], dim=-1),
                               start.unsqueeze(1))
@@ -633,7 +657,7 @@ class HorizonSequence:
             # skipped reach gets no ramp (it is a hold), and the reach after it starts from the
             # target held during the skip, not from the skipped target.
             for k in range(R):
-                pk = pulse_times[:, k:k + 1]                            # segment start (n, 1)
+                pk = onsets[:, k:k + 1]                                 # segment start (n, 1)
                 seg_len = (bounds[:, k:k + 1] - pk).clamp(min=1)
                 mj = seg_len.clamp(max=self.mj_move_steps).float()
                 s = _min_jerk_s((tg - pk).float() / mj)                 # (n, T)
@@ -646,7 +670,7 @@ class HorizonSequence:
                                        pidx - 1, pidx).clamp(min=0)
                     prev = targets[torch.arange(n, device=dev), pidx]    # (n, 2)
                 ramp = prev.unsqueeze(1) + (targets[:, k] - prev).unsqueeze(1) * s.unsqueeze(-1)
-                mask = ((cur == k) & moved & (k < cap).unsqueeze(1)
+                mask = ((cur_des - 1 == k) & moved & (k < cap).unsqueeze(1)
                         & ~(has_skip & (skip_col == k)))                # no ramp on a skipped reach
                 desired = torch.where(mask.unsqueeze(-1), ramp, desired)
 
@@ -662,17 +686,11 @@ class HorizonSequence:
         # and the first reach of every trial, visible throughout the delay) are untouched, so they
         # can still launch immediately.
         loss_mask = torch.ones(n, T, dtype=torch.bool, device=dev)
-        if self.blind_mask_steps > 0:
-            b = int(self.blind_mask_steps)
-            ks = torch.arange(R, device=dev).view(1, R)                 # (1, R)
-            # target k first enters a lit slot during segment max(0, k - h + 1); it is unpreviewed
-            # exactly when that is its own segment (horizon 1) and it is not the first reach.
-            unpreviewed = (((ks - horizon.view(n, 1) + 1).clamp(min=0) == ks) & (ks > 0)
-                           & (ks < cap.view(n, 1)))
-            unpreviewed = unpreviewed & ~(has_skip & (skip_col == ks))
+        if self.blind_mode == 'mask' and self.blind_steps > 0:
             for k in range(R):
                 pk = pulse_times[:, k:k + 1]                            # (n, 1)
-                loss_mask &= ~((tg >= pk) & (tg < pk + b) & unpreviewed[:, k:k + 1])
+                loss_mask &= ~((tg >= pk) & (tg < pk + self.blind_steps)
+                               & unpreviewed[:, k:k + 1])
 
         # per-trial epoch boundaries (step indices); not used in training, handy for analysis
         timestamps = {
