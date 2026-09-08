@@ -47,6 +47,18 @@ p.add_argument("--w-loss-action", type=float, default=0.5)
 p.add_argument("--w-loss-action-diff", type=float, default=3e-3)
 p.add_argument("--w-loss-hidden", type=float, default=3e-4)
 p.add_argument("--w-loss-hidden-diff", type=float, default=3e-2)
+# urgency: push toward whichever target is currently `desired` with a weight that rises the
+# longer it has been active, so reacting/converging faster is directly rewarded. Reuses the
+# task's own `target_onsets` (when available) as the ramp start per target, so a target that
+# is still in its sensory-blind window (unpreviewed reach, blind_mode='delay') gets zero
+# urgency until `desired` itself would switch to it -- this cannot recreate the premature-
+# movement problem blind_mode='delay' was added to suppress. 0 = off (default).
+p.add_argument("--w-loss-urgency", type=float, default=0.0,
+               help="weight on a time-rising penalty of distance to the currently-active "
+                    "target; encourages fast, early convergence once a target is 'live'. "
+                    "0 = off (default)")
+p.add_argument("--urgency-tau-ms", type=float, default=300.0,
+               help="time constant (ms) of the urgency ramp; smaller = more urgent / faster reach")
 # noise in traininz
 p.add_argument("--obs-noise", type=float, default=0.1,
                help="std of Gaussian noise on observed body state (vision fingertip + proprio); 0 = off")
@@ -311,9 +323,35 @@ for i in tqdm(range(args.n_batch)):
     loss_hidden = _hidden.pow(2).sum(-1).mean()
     loss_hidden_diff = _hidden_diff.pow(2).sum(-1).mean()
 
+    # urgency: for each per-reach target window [target_onsets[k], target_onsets[k+1]), penalize
+    # distance-to-`desired` with a weight rising as u(t) = 1 - exp(-(t - onset_k)/tau). Built
+    # directly on `desired`/`target_onsets` (not a separately-tracked target list), so a skipped
+    # (no_go_reach) reach's held-over window is scored the same way as a normal one, and a full
+    # no-go trial (desired frozen at start throughout) is excluded via `is_no_go` below, matching
+    # the original single-target urgency loss (commit 713fefc) it generalizes.
+    if args.w_loss_urgency > 0 and isinstance(ts, dict) and 'target_onsets' in ts:
+        onsets = ts['target_onsets'].to(device)                             # (n, R)
+        final_start = ts['final_start'].to(device)                         # (n,)
+        is_nogo = ts.get('is_no_go')
+        Tt = torch.arange(states.pos.shape[1], device=device).unsqueeze(0)  # (1, T)
+        tau_u = max(1.0, args.urgency_tau_ms / 1000.0 / args.dt)
+        ends = torch.cat([onsets[:, 1:], final_start.unsqueeze(1)], dim=1)  # (n, R)
+        dist = (tracked - desired).abs().sum(-1)                            # (n, T)
+        u_total = torch.zeros_like(dist)
+        for k in range(onsets.shape[1]):
+            pk, ek = onsets[:, k:k + 1], ends[:, k:k + 1]
+            active = (Tt >= pk) & (Tt < ek)
+            u_total = u_total + (1.0 - torch.exp(-(Tt - pk).clamp(min=0).float() / tau_u)) * active.float()
+        if is_nogo is not None:
+            u_total = u_total * (~is_nogo.to(device)).float().unsqueeze(1)
+        loss_urgency = (dist * u_total).sum() / u_total.sum().clamp(min=1.0)
+    else:
+        loss_urgency = torch.zeros((), device=device)
+
     loss = (args.w_loss_pos * loss_pos + args.w_loss_jerk * loss_jerk
             + args.w_loss_action * loss_action + args.w_loss_action_diff * loss_action_diff
-            + args.w_loss_hidden * loss_hidden + args.w_loss_hidden_diff * loss_hidden_diff)
+            + args.w_loss_hidden * loss_hidden + args.w_loss_hidden_diff * loss_hidden_diff
+            + args.w_loss_urgency * loss_urgency)
 
     opt.zero_grad()
     loss.backward()
@@ -324,7 +362,8 @@ for i in tqdm(range(args.n_batch)):
     if args.track:
         contrib = {'loss_tot': loss, 'pos': args.w_loss_pos * loss_pos, 'jerk': args.w_loss_jerk * loss_jerk,
             'muscle': args.w_loss_action * loss_action, 'muscle_diff': args.w_loss_action_diff * loss_action_diff, 'hidden':args.w_loss_hidden * loss_hidden,
-            'hidden_diff':  args.w_loss_hidden_diff * loss_hidden_diff }
+            'hidden_diff':  args.w_loss_hidden_diff * loss_hidden_diff,
+            'urgency': args.w_loss_urgency * loss_urgency }
 
         wandb.log({f'{k}': v.item() for k, v in contrib.items()}, step=i)
 
