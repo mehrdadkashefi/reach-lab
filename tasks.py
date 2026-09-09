@@ -703,14 +703,6 @@ class HorizonSequence:
             'is_no_go':      nogo,
             'no_go_reach':   no_go_reach.long(),
             'loss_mask':     loss_mask,       # False where the target cannot yet be perceived
-            'unpreviewed':   unpreviewed,     # (n, R) target was not visible before its own pulse
-            'target_onsets': onsets,          # (n, R) step each target becomes `desired` (already
-                                               # includes the blind-window shift for unpreviewed
-                                               # reaches under blind_mode='delay' -- the single
-                                               # source of truth for "when is it fair to demand
-                                               # progress toward this target", reused by any
-                                               # per-reach urgency/timing loss so it can't drift
-                                               # out of sync with what `desired` itself does.
         }
         return theta0, inp, desired, perturbation, timestamps
 
