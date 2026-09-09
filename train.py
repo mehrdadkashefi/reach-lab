@@ -47,6 +47,16 @@ p.add_argument("--w-loss-action", type=float, default=0.5)
 p.add_argument("--w-loss-action-diff", type=float, default=3e-3)
 p.add_argument("--w-loss-hidden", type=float, default=3e-4)
 p.add_argument("--w-loss-hidden-diff", type=float, default=3e-2)
+# blind-hold: an unpreviewed reach's target is invisible for the first `blind_steps` (one visual
+# delay) after its own go-pulse; blind_mode='delay' already freezes `desired` at the previous
+# target over that window, so the ordinary position loss is in principle already penalising any
+# drift there -- but that weight is shared with the whole trial and empirically isn't enough to
+# fully suppress premature movement. This isolates just that window and gives it its own weight,
+# so it can be pushed hard without changing position-loss pressure everywhere else. 0 = off.
+p.add_argument("--w-loss-blind-hold", type=float, default=0.0,
+               help="extra weight on position error specifically during an unpreviewed reach's "
+                    "sensory-blind window (on top of the ordinary w-loss-pos, which already "
+                    "applies there too). 0 = off (default)")
 # noise in traininz
 p.add_argument("--obs-noise", type=float, default=0.1,
                help="std of Gaussian noise on observed body state (vision fingertip + proprio); 0 = off")
@@ -311,9 +321,29 @@ for i in tqdm(range(args.n_batch)):
     loss_hidden = _hidden.pow(2).sum(-1).mean()
     loss_hidden_diff = _hidden_diff.pow(2).sum(-1).mean()
 
+    # blind-hold: isolate the unpreviewed-reach blind window and re-score the SAME position error
+    # (`_err`, already computed above) with its own weight -- see arg help above.
+    if (args.w_loss_blind_hold > 0 and isinstance(ts, dict) and 'unpreviewed' in ts
+            and getattr(task, 'blind_steps', 0) > 0):
+        move_start = ts['move_start'].to(device)                            # (n,)
+        capture = ts['capture_times'].to(device)                           # (n, R)
+        unpv = ts['unpreviewed'].to(device)                                 # (n, R)
+        n_, R_ = capture.shape
+        pulse = torch.cat([move_start.unsqueeze(1), capture[:, :-1]], dim=1)  # (n, R)
+        Tt = torch.arange(states.pos.shape[1], device=device).unsqueeze(0)  # (1, T)
+        blind_active = torch.zeros(n_, states.pos.shape[1], dtype=torch.bool, device=device)
+        for k in range(R_):
+            pk = pulse[:, k:k + 1]
+            blind_active |= (Tt >= pk) & (Tt < pk + task.blind_steps) & unpv[:, k:k + 1]
+        blind_active_f = blind_active.float()
+        loss_blind_hold = (_err * blind_active_f).sum() / blind_active_f.sum().clamp(min=1.0)
+    else:
+        loss_blind_hold = torch.zeros((), device=device)
+
     loss = (args.w_loss_pos * loss_pos + args.w_loss_jerk * loss_jerk
             + args.w_loss_action * loss_action + args.w_loss_action_diff * loss_action_diff
-            + args.w_loss_hidden * loss_hidden + args.w_loss_hidden_diff * loss_hidden_diff)
+            + args.w_loss_hidden * loss_hidden + args.w_loss_hidden_diff * loss_hidden_diff
+            + args.w_loss_blind_hold * loss_blind_hold)
 
     opt.zero_grad()
     loss.backward()
@@ -324,7 +354,8 @@ for i in tqdm(range(args.n_batch)):
     if args.track:
         contrib = {'loss_tot': loss, 'pos': args.w_loss_pos * loss_pos, 'jerk': args.w_loss_jerk * loss_jerk,
             'muscle': args.w_loss_action * loss_action, 'muscle_diff': args.w_loss_action_diff * loss_action_diff, 'hidden':args.w_loss_hidden * loss_hidden,
-            'hidden_diff':  args.w_loss_hidden_diff * loss_hidden_diff }
+            'hidden_diff':  args.w_loss_hidden_diff * loss_hidden_diff,
+            'blind_hold': args.w_loss_blind_hold * loss_blind_hold }
 
         wandb.log({f'{k}': v.item() for k, v in contrib.items()}, step=i)
 

@@ -703,6 +703,7 @@ class HorizonSequence:
             'is_no_go':      nogo,
             'no_go_reach':   no_go_reach.long(),
             'loss_mask':     loss_mask,       # False where the target cannot yet be perceived
+            'unpreviewed':   unpreviewed,     # (n, R) target was not visible before its own pulse
         }
         return theta0, inp, desired, perturbation, timestamps
 
