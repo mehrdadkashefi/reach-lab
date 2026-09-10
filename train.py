@@ -52,11 +52,16 @@ p.add_argument("--w-loss-hidden-diff", type=float, default=3e-2)
 # target over that window, so the ordinary position loss is in principle already penalising any
 # drift there -- but that weight is shared with the whole trial and empirically isn't enough to
 # fully suppress premature movement. This isolates just that window and gives it its own weight,
-# so it can be pushed hard without changing position-loss pressure everywhere else. 0 = off.
+# so it can be pushed hard without changing position-loss pressure everywhere else. Also applies,
+# unconditionally (all horizons), to reach 0's own post-pulse window -- not a sensory-delay case
+# (its target is always previewed), but the same discipline targets "chunking": reach 0's approach
+# blending in prep for reach 1 (loops/hooks visible in H2/H3 trajectories even though target0 is
+# fully known). 0 = off.
 p.add_argument("--w-loss-blind-hold", type=float, default=0.0,
                help="extra weight on position error specifically during an unpreviewed reach's "
                     "sensory-blind window (on top of the ordinary w-loss-pos, which already "
-                    "applies there too). 0 = off (default)")
+                    "applies there too), and during reach 0's own equivalent post-pulse window "
+                    "(all horizons). 0 = off (default)")
 # noise in traininz
 p.add_argument("--obs-noise", type=float, default=0.1,
                help="std of Gaussian noise on observed body state (vision fingertip + proprio); 0 = off")
@@ -334,7 +339,15 @@ for i in tqdm(range(args.n_batch)):
         blind_active = torch.zeros(n_, states.pos.shape[1], dtype=torch.bool, device=device)
         for k in range(R_):
             pk = pulse[:, k:k + 1]
-            blind_active |= (Tt >= pk) & (Tt < pk + task.blind_steps) & unpv[:, k:k + 1]
+            # reach 0's own target is always visible (never 'unpreviewed', regardless of
+            # horizon), so it never gates in here on its own -- apply the same post-pulse
+            # hold window to it unconditionally instead, for every horizon. This targets
+            # the "chunking" behavior seen even in H2/H3 (loops/hooks in reach0's approach,
+            # apparently blending in prep for reach1) that the pre-pulse trajectory analysis
+            # found -- not a sensory-delay argument like the k>0 case, just the same
+            # discipline applied to the one reach the formal mask always excludes.
+            gate = torch.ones_like(unpv[:, k:k + 1]) if k == 0 else unpv[:, k:k + 1]
+            blind_active |= (Tt >= pk) & (Tt < pk + task.blind_steps) & gate
         blind_active_f = blind_active.float()
         loss_blind_hold = (_err * blind_active_f).sum() / blind_active_f.sum().clamp(min=1.0)
     else:
