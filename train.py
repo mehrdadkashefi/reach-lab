@@ -57,6 +57,17 @@ p.add_argument("--w-loss-blind-hold", type=float, default=0.0,
                help="extra weight on position error specifically during an unpreviewed reach's "
                     "sensory-blind window (on top of the ordinary w-loss-pos, which already "
                     "applies there too). 0 = off (default)")
+# straight-line: horizon_sequence reach 0 was found to take a very indirect path to its own
+# target when horizon>1 (arc-length / straight-line-distance ratio ~2.5x, vs ~1.5x at horizon=1)
+# -- not aimed at the next target or their centroid, just generically non-committal ("sweeping").
+# Jerk/action penalties reward smoothness generically and are satisfied just as well by a smooth
+# detour, so they don't discourage this. This penalizes actual wasted distance directly: arc
+# length over [delay_start, capture_of_reach_0] minus the straight-line distance from where the
+# target first becomes visible to the target itself -- always >= 0 by the triangle inequality, so
+# no clamping needed. 0 = off.
+p.add_argument("--w-loss-path-length", type=float, default=0.0,
+               help="weight on reach 0's excess path length (arc length beyond the straight-line "
+                    "distance to its own target, over [delay_start, capture0]). 0 = off (default)")
 # noise in traininz
 p.add_argument("--obs-noise", type=float, default=0.1,
                help="std of Gaussian noise on observed body state (vision fingertip + proprio); 0 = off")
@@ -340,10 +351,30 @@ for i in tqdm(range(args.n_batch)):
     else:
         loss_blind_hold = torch.zeros((), device=device)
 
+    # straight-line: penalize reach 0's excess path length -- see arg help above.
+    if args.w_loss_path_length > 0 and isinstance(ts, dict) and 'delay_start' in ts:
+        delay_start = ts['delay_start'].to(device)                          # (n,)
+        capture0 = ts['capture_times'][:, 0].to(device)                     # (n,)
+        n_ = states.pos.shape[0]
+        Tt = torch.arange(states.pos.shape[1], device=device).unsqueeze(0)  # (1, T)
+        active_step = (Tt[:, :-1] >= delay_start.unsqueeze(1)) & (Tt[:, :-1] < capture0.unsqueeze(1))
+        step_dist = (states.pos[:, 1:] - states.pos[:, :-1]).norm(dim=-1)   # (n, T-1)
+        arc_length = (step_dist * active_step.float()).sum(-1)              # (n,)
+        idx_delay = delay_start.clamp(max=states.pos.shape[1] - 1)
+        idx_cap = (capture0 - 1).clamp(min=0)
+        rows = torch.arange(n_, device=device)
+        pos_at_delay = states.pos[rows, idx_delay]                          # (n, 2)
+        target0 = desired[rows, idx_cap]                                    # (n, 2)
+        straight = (target0 - pos_at_delay).norm(dim=-1)                    # (n,)
+        loss_path_length = (arc_length - straight).mean()
+    else:
+        loss_path_length = torch.zeros((), device=device)
+
     loss = (args.w_loss_pos * loss_pos + args.w_loss_jerk * loss_jerk
             + args.w_loss_action * loss_action + args.w_loss_action_diff * loss_action_diff
             + args.w_loss_hidden * loss_hidden + args.w_loss_hidden_diff * loss_hidden_diff
-            + args.w_loss_blind_hold * loss_blind_hold)
+            + args.w_loss_blind_hold * loss_blind_hold
+            + args.w_loss_path_length * loss_path_length)
 
     opt.zero_grad()
     loss.backward()
@@ -355,7 +386,8 @@ for i in tqdm(range(args.n_batch)):
         contrib = {'loss_tot': loss, 'pos': args.w_loss_pos * loss_pos, 'jerk': args.w_loss_jerk * loss_jerk,
             'muscle': args.w_loss_action * loss_action, 'muscle_diff': args.w_loss_action_diff * loss_action_diff, 'hidden':args.w_loss_hidden * loss_hidden,
             'hidden_diff':  args.w_loss_hidden_diff * loss_hidden_diff,
-            'blind_hold': args.w_loss_blind_hold * loss_blind_hold }
+            'blind_hold': args.w_loss_blind_hold * loss_blind_hold,
+            'path_length': args.w_loss_path_length * loss_path_length }
 
         wandb.log({f'{k}': v.item() for k, v in contrib.items()}, step=i)
 
