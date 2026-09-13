@@ -63,8 +63,9 @@ p.add_argument("--w-loss-blind-hold", type=float, default=0.0,
 # Jerk/action penalties reward smoothness generically and are satisfied just as well by a smooth
 # detour, so they don't discourage this. This penalizes actual wasted distance directly: arc
 # length over [delay_start, capture_of_reach_0] minus the straight-line distance from where the
-# target first becomes visible to the target itself -- always >= 0 by the triangle inequality, so
-# no clamping needed. 0 = off.
+# target first becomes visible to the target itself, clamped at 0 (that gap is only guaranteed
+# non-negative once the arm actually reaches the target -- see the clamp comment at the loss
+# itself for why). 0 = off.
 p.add_argument("--w-loss-path-length", type=float, default=0.0,
                help="weight on reach 0's excess path length (arc length beyond the straight-line "
                     "distance to its own target, over [delay_start, capture0]). 0 = off (default)")
@@ -366,7 +367,13 @@ for i in tqdm(range(args.n_batch)):
         pos_at_delay = states.pos[rows, idx_delay]                          # (n, 2)
         target0 = desired[rows, idx_cap]                                    # (n, 2)
         straight = (target0 - pos_at_delay).norm(dim=-1)                    # (n,)
-        loss_path_length = (arc_length - straight).mean()
+        # arc >= straight-line distance between the arm's OWN start/end points, by the triangle
+        # inequality -- NOT >= distance-to-target. Early in training (or whenever tracking is
+        # poor) the arm barely moves while the target sits far away, so this gap can go negative;
+        # unclamped, minimizing it would reward staying far from an unreached target. Clamp at 0:
+        # no penalty until the arm is actually near the target, matching what the diagnostic
+        # (arc/straight ratio, always measured on trained/reasonably-accurate checkpoints) assumed.
+        loss_path_length = (arc_length - straight).clamp(min=0).mean()
     else:
         loss_path_length = torch.zeros((), device=device)
 
