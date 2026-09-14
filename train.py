@@ -352,21 +352,22 @@ for i in tqdm(range(args.n_batch)):
     else:
         loss_blind_hold = torch.zeros((), device=device)
 
-    # straight-line: penalize reach 0's excess path length -- see arg help above.
+    # straight-line: penalize reach 0's excess path length -- see arg help above. Arc length is
+    # the Riemann-sum integral of speed (states.vel is already a physics output, no need to
+    # difference positions or shift indices by one step).
     if args.w_loss_path_length > 0 and isinstance(ts, dict) and 'delay_start' in ts:
         delay_start = ts['delay_start'].to(device)                          # (n,)
         capture0 = ts['capture_times'][:, 0].to(device)                     # (n,)
         n_ = states.pos.shape[0]
-        Tt = torch.arange(states.pos.shape[1], device=device).unsqueeze(0)  # (1, T)
-        active_step = (Tt[:, :-1] >= delay_start.unsqueeze(1)) & (Tt[:, :-1] < capture0.unsqueeze(1))
-        # torch.norm's gradient is x/||x|| -- NaN at exactly zero. Consecutive positions are
-        # exactly equal constantly (the arm barely moving early in training, any held segment),
-        # and masking the *value* afterward doesn't help: 0 * NaN = NaN, not 0, so a single
-        # zero-distance step anywhere silently poisons the gradient for states.pos -- shared by
-        # every other loss term. sqrt(sum-of-squares + eps) keeps the gradient finite everywhere.
         eps = 1e-12
-        step_dist = (((states.pos[:, 1:] - states.pos[:, :-1]) ** 2).sum(-1) + eps).sqrt()
-        arc_length = (step_dist * active_step.float()).sum(-1)              # (n,)
+        Tt = torch.arange(states.pos.shape[1], device=device).unsqueeze(0)  # (1, T)
+        active = (Tt >= delay_start.unsqueeze(1)) & (Tt < capture0.unsqueeze(1))
+        # sqrt(sum-of-squares + eps), not .norm(): norm's gradient (x/||x||) is NaN at exactly
+        # zero speed (the arm at rest constantly, early in training or any held segment), and
+        # masking the *value* afterward doesn't save it -- 0 * NaN = NaN, silently poisoning the
+        # gradient for every other loss term that also depends on states.vel/pos.
+        speed = ((states.vel ** 2).sum(-1) + eps).sqrt()                    # (n, T)
+        arc_length = (speed * active.float()).sum(-1) * args.dt             # (n,)
         idx_delay = delay_start.clamp(max=states.pos.shape[1] - 1)
         idx_cap = (capture0 - 1).clamp(min=0)
         rows = torch.arange(n_, device=device)
