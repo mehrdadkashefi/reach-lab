@@ -359,14 +359,20 @@ for i in tqdm(range(args.n_batch)):
         n_ = states.pos.shape[0]
         Tt = torch.arange(states.pos.shape[1], device=device).unsqueeze(0)  # (1, T)
         active_step = (Tt[:, :-1] >= delay_start.unsqueeze(1)) & (Tt[:, :-1] < capture0.unsqueeze(1))
-        step_dist = (states.pos[:, 1:] - states.pos[:, :-1]).norm(dim=-1)   # (n, T-1)
+        # torch.norm's gradient is x/||x|| -- NaN at exactly zero. Consecutive positions are
+        # exactly equal constantly (the arm barely moving early in training, any held segment),
+        # and masking the *value* afterward doesn't help: 0 * NaN = NaN, not 0, so a single
+        # zero-distance step anywhere silently poisons the gradient for states.pos -- shared by
+        # every other loss term. sqrt(sum-of-squares + eps) keeps the gradient finite everywhere.
+        eps = 1e-12
+        step_dist = (((states.pos[:, 1:] - states.pos[:, :-1]) ** 2).sum(-1) + eps).sqrt()
         arc_length = (step_dist * active_step.float()).sum(-1)              # (n,)
         idx_delay = delay_start.clamp(max=states.pos.shape[1] - 1)
         idx_cap = (capture0 - 1).clamp(min=0)
         rows = torch.arange(n_, device=device)
         pos_at_delay = states.pos[rows, idx_delay]                          # (n, 2)
         target0 = desired[rows, idx_cap]                                    # (n, 2)
-        straight = (target0 - pos_at_delay).norm(dim=-1)                    # (n,)
+        straight = (((target0 - pos_at_delay) ** 2).sum(-1) + eps).sqrt()  # (n,)
         # arc >= straight-line distance between the arm's OWN start/end points, by the triangle
         # inequality -- NOT >= distance-to-target. Early in training (or whenever tracking is
         # poor) the arm barely moves while the target sits far away, so this gap can go negative;
