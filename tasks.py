@@ -438,8 +438,24 @@ class HorizonSequence:
                  prob_no_go=0.15, prob_no_go_reach=0.0,
                  desired_profile='step', mj_move_steps=30, go_pulse_ms=150,
                  blind_mode='delay', blind_ms=None,
+                 capture_mode='scripted', capture_radius_cm=1.0, capture_hold_ms=300,
+                 reach_timeout_ms=800,
                  perturb_prob=0.0, perturb_mag=0.0, perturb_dur_ms=100, **kwargs):
         self.effector = effector
+        # How a target gets captured (and the next reach cued):
+        #   'scripted'   : at a pre-sampled time (dwell_range_ms) regardless of where the hand
+        #                  is. The whole instruction stream is built ahead of the rollout.
+        #   'contingent' : only once the hand has stayed within capture_radius_cm of the target
+        #                  for capture_hold_ms, checked against the true hand position every
+        #                  step of the rollout (ContingentStepper); force-advanced after
+        #                  reach_timeout_ms. Makes "sweep near the target without committing"
+        #                  impossible instead of merely costly.
+        assert capture_mode in ('scripted', 'contingent')
+        self.capture_mode = capture_mode
+        ms2steps = lambda ms: max(1, round(ms / 1000 / effector.dt))
+        self.capture_radius = capture_radius_cm / 100.0
+        self.capture_hold_steps = ms2steps(capture_hold_ms)
+        self.reach_timeout_steps = ms2steps(reach_timeout_ms)
         # How to handle the window after an *unpreviewed* go cue, during which the target has not
         # reached the controller yet (sensory delay):
         #   'delay' : the desired holds at the previous target across the window, so waiting is
@@ -477,8 +493,20 @@ class HorizonSequence:
         self.delay_lo, self.delay_hi = ms2steps(delay_range_ms[0]), ms2steps(delay_range_ms[1])
         self.dwell_lo, self.dwell_hi = ms2steps(dwell_range_ms[0]), ms2steps(dwell_range_ms[1])
         self.final_lo, self.final_hi = ms2steps(final_range_ms[0]), ms2steps(final_range_ms[1])
+        if self.contingent:
+            # no-go variants are time-scripted; keep them off until they get a contingent
+            # definition of their own
+            assert self.prob_no_go == 0.0 and self.prob_no_go_reach == 0.0, \
+                "capture_mode='contingent' does not support no-go trials yet"
+            per_reach = self.reach_timeout_steps          # worst case: every reach times out
+        else:
+            per_reach = self.dwell_hi
         self.steps = (self.init_hi + self.delay_hi
-                      + self.n_reaches * self.dwell_hi + self.final_hi)
+                      + self.n_reaches * per_reach + self.final_hi)
+
+    @property
+    def contingent(self):
+        return self.capture_mode == 'contingent'
 
     # -- spec helpers ------------------------------------------------------------------
     def _resolve_spec_geometry(self, spec, dev):
@@ -543,8 +571,13 @@ class HorizonSequence:
             d2   = torch.randint(self.delay_lo, self.delay_hi + 1, (n, 1), device=dev)
             dseg = torch.randint(self.dwell_lo, self.dwell_hi + 1, (n, R), device=dev)
             d4   = torch.randint(self.final_lo, self.final_hi + 1, (n, 1), device=dev)
-            pre  = T - (d1 + d2 + dseg.sum(1, keepdim=True) + d4)       # slack -> initial hold
-            t_delay = pre + d1
+            if self.contingent:
+                # reach durations aren't known ahead of time, so the trial can't be
+                # right-aligned: slack goes to the end (final hold at the last target)
+                t_delay = d1
+            else:
+                pre  = T - (d1 + d2 + dseg.sum(1, keepdim=True) + d4)   # slack -> initial hold
+                t_delay = pre + d1
             t_go    = t_delay + d2
             horizon = torch.multinomial(self.horizon_probs.to(dev), n, replacement=True) + 1
             nogo    = torch.rand(n, device=dev) < self.prob_no_go                     # (n,)
@@ -562,7 +595,10 @@ class HorizonSequence:
                                                      mid(self.dwell_lo, self.dwell_hi))), (n, R))
             dseg = torch.as_tensor(np.array(dw), device=dev).long()                  # (n, R)
             d4 = _as_col(spec.get("final_steps", mid(self.final_lo, self.final_hi)), n, dev)
-            T = int((d1 + d2 + dseg.sum(1, keepdim=True) + d4).max().item())
+            if self.contingent:
+                T = int((d1 + d2 + d4).max().item()) + R * self.reach_timeout_steps
+            else:
+                T = int((d1 + d2 + dseg.sum(1, keepdim=True) + d4).max().item())
             t_delay = d1                                                # left-aligned
             t_go    = d1 + d2
             horizon = _as_col(spec.get("horizon", self.n_slots), n, dev).squeeze(1)
@@ -576,38 +612,20 @@ class HorizonSequence:
             perturbation = _constant_perturbation(eff, spec.get("perturbation"), n, T, dev)
 
         start = eff.joint_to_cart(theta0)                               # (n, 2)
+        if self.contingent:
+            assert not (no_go_reach >= 0).any(), \
+                "capture_mode='contingent' does not support no_go_reach yet"
+            stepper = ContingentStepper(self, theta0, start, targets, t_delay, t_go, horizon,
+                                        nogo, pulse, T)
+            return theta0, stepper.inp, None, perturbation, stepper
+
         bounds = t_go + dseg.cumsum(1)                                  # (n, R) capture times
         pulse_times = torch.cat([t_go, bounds[:, :-1]], dim=1)          # (n, R) go for reach k
-        final_start = bounds[:, -1]                                     # (n,)
-
-        # Two independent no-go variants, both implemented here:
-        #   trial no-go (cap = 0): no pulse ever fires and the hand holds at the start posture for
-        #       the whole episode; the target display freezes at the beginning of the sequence.
-        #   reach no-go (skip = r): reach r alone receives no pulse, so the hand simply stays where
-        #       it is for that segment -- reach r-1's dwell is effectively extended -- and the
-        #       sequence then RESUMES normally at reach r+1 (target r is skipped, never reached).
-        cap = torch.full((n,), R, dtype=torch.long, device=dev)
-        cap = torch.where(nogo, torch.zeros_like(cap), cap)
-        skip = no_go_reach.clone()                                      # (n,) -1 = no skipped reach
-        skip = torch.where(nogo, torch.full_like(skip, -1), skip)       # variants are exclusive
-        skip_col = skip.unsqueeze(1)                                    # (n, 1)
-        has_skip = (skip >= 0).unsqueeze(1)
+        cap, skip, skip_col, has_skip = self._nogo_masks(nogo, no_go_reach, R)
 
         tg = torch.arange(T, device=dev).unsqueeze(0)                   # (1, T)
         cur = (tg.unsqueeze(-1) >= bounds.unsqueeze(1)).sum(-1)         # (n, T) captures so far
         cur_eff = torch.minimum(cur, cap.unsqueeze(1))                  # frozen on no-go variants
-        shown_time = tg >= t_delay                                      # targets visible from delay
-
-        # ---- instruction stream: 3 slots x [x, y, on] + go --------------------------------
-        inp = torch.zeros(n, T, self.input_channels, device=dev)
-        tx, ty = targets[..., 0], targets[..., 1]                       # (n, R)
-        for j in range(self.n_slots):
-            idx = cur_eff + j                                           # target index in slot j
-            on = (idx < R) & (j < horizon.unsqueeze(1)) & shown_time
-            idxc = idx.clamp(max=R - 1)
-            inp[:, :, 3 * j]     = tx.gather(1, idxc) * on.float()
-            inp[:, :, 3 * j + 1] = ty.gather(1, idxc) * on.float()
-            inp[:, :, 3 * j + 2] = on.float()
 
         # go channel: one pulse per cued reach, at t_go and at each capture. A skipped reach (and
         # every reach on a trial no-go) gets no pulse; the rest are unaffected.
@@ -621,7 +639,61 @@ class HorizonSequence:
                 win = (tg >= pk) & (tg < pk + pulse) & (cur == k)       # clipped to segment k
                 win = win & (k < cap).unsqueeze(1) & ~(has_skip & (skip_col == k))
                 go = torch.maximum(go, win.float())
-        inp[:, :, 3 * self.n_slots] = go
+        inp = self._instruction(cur_eff, tg >= t_delay, go, targets, horizon)
+
+        desired, timestamps = self._outputs(start, targets, t_delay, t_go, bounds, pulse_times,
+                                            horizon, nogo, no_go_reach, T)
+        return theta0, inp, desired, perturbation, timestamps
+
+    # -- shared by the scripted path above and ContingentStepper -------------------------
+    @staticmethod
+    def _nogo_masks(nogo, no_go_reach, R):
+        """Two independent no-go variants:
+          trial no-go (cap = 0): no pulse ever fires and the hand holds at the start posture for
+              the whole episode; the target display freezes at the beginning of the sequence.
+          reach no-go (skip = r): reach r alone receives no pulse, so the hand simply stays where
+              it is for that segment -- reach r-1's dwell is effectively extended -- and the
+              sequence then RESUMES normally at reach r+1 (target r is skipped, never reached).
+        """
+        cap = torch.full_like(nogo, R, dtype=torch.long)
+        cap = torch.where(nogo, torch.zeros_like(cap), cap)
+        skip = no_go_reach.clone()                                      # (n,) -1 = no skipped reach
+        skip = torch.where(nogo, torch.full_like(skip, -1), skip)       # variants are exclusive
+        skip_col = skip.unsqueeze(1)                                    # (n, 1)
+        has_skip = (skip >= 0).unsqueeze(1)
+        return cap, skip, skip_col, has_skip
+
+    def _instruction(self, cur_eff, shown, go, targets, horizon):
+        """Instruction stream rows, 3 slots x [x, y, on] + go. cur_eff / shown / go are (n, K)
+        -- K = T for a whole scripted trial, K = 1 for one step of a contingent one -- giving
+        (n, K, input_channels). Slot j shows the (cur_eff + j)-th target if j < horizon, that
+        target exists, and the targets are shown at all."""
+        n, K = cur_eff.shape
+        R = targets.shape[1]
+        tx, ty = targets[..., 0], targets[..., 1]                       # (n, R)
+        inp = torch.zeros(n, K, self.input_channels, device=targets.device)
+        for j in range(self.n_slots):
+            idx = cur_eff + j                                           # target index in slot j
+            on = (idx < R) & (j < horizon.view(n, 1)) & shown
+            idxc = idx.clamp(max=R - 1)
+            inp[:, :, 3 * j]     = tx.gather(1, idxc) * on.float()
+            inp[:, :, 3 * j + 1] = ty.gather(1, idxc) * on.float()
+            inp[:, :, 3 * j + 2] = on.float()
+        inp[:, :, 3 * self.n_slots] = go.float()
+        return inp
+
+    def _outputs(self, start, targets, t_delay, t_go, bounds, pulse_times, horizon, nogo,
+                 no_go_reach, T):
+        """`desired` and the timestamps dict from per-reach capture times `bounds` (n, R) and
+        go-pulse times `pulse_times` (n, R). One code path whether those are scripted
+        (make_batch) or realized (ContingentStepper.finalize), so the blind_mode and no-go
+        semantics cannot drift apart between the two."""
+        n, R = targets.shape[:2]
+        dev = targets.device
+        tx, ty = targets[..., 0], targets[..., 1]                       # (n, R)
+        cap, skip, skip_col, has_skip = self._nogo_masks(nogo, no_go_reach, R)
+        tg = torch.arange(T, device=dev).unsqueeze(0)                   # (1, T)
+        final_start = bounds[:, -1]                                     # (n,)
 
         # ---- which reaches are unpreviewed? ---------------------------------------------------
         # Target k first enters a lit slot during segment max(0, k - h + 1); it is unpreviewed
@@ -705,7 +777,104 @@ class HorizonSequence:
             'loss_mask':     loss_mask,       # False where the target cannot yet be perceived
             'unpreviewed':   unpreviewed,     # (n, R) target was not visible before its own pulse
         }
-        return theta0, inp, desired, perturbation, timestamps
+        return desired, timestamps
+
+
+class ContingentStepper:
+    """Closed-loop instruction stream for HorizonSequence(capture_mode='contingent').
+
+    make_batch returns one of these in place of a finished (inp, desired, timestamps): the
+    capture times aren't known until the hand has actually gone somewhere. Effector.rollout
+    calls `step(s, pos)` at the top of every timestep with the hand's true position at the end
+    of the previous one; it advances the capture bookkeeping and writes that step's instruction
+    row into `inp` in place (rollout then reads it through the usual visual delay). After the
+    rollout, `finalize()` turns the realized capture times into `desired` + timestamps through
+    the same HorizonSequence._outputs the scripted mode uses. Call `reset()` before reusing
+    the same batch for another rollout (rollout_batch does).
+
+    Capture rule, per trial: reach k is live from its go-pulse (t_go for k = 0, the previous
+    capture otherwise). It is captured at the first step at which the hand has been within
+    `capture_radius` of target k for `capture_hold_steps` consecutive steps -- or, failing
+    that, `reach_timeout_steps` after its pulse (force-advance, recorded in timestamps
+    'timeouts'). Capture fires the next reach's pulse and shifts the slots, exactly as a
+    scripted capture does.
+    """
+
+    def __init__(self, task, theta0, start, targets, t_delay, t_go, horizon, nogo, pulse, T):
+        self.task = task
+        self.theta0, self.start, self.targets = theta0, start, targets      # targets (n, R, 2)
+        self.t_delay, self.t_go = t_delay, t_go                             # (n, 1)
+        self.horizon, self.nogo, self.pulse, self.T = horizon, nogo, pulse, T
+        self.n, self.R = targets.shape[:2]
+        self.inp = torch.zeros(self.n, T, task.input_channels, device=targets.device)
+        self.reset()
+
+    def reset(self):
+        n, R, dev = self.n, self.R, self.targets.device
+        self.inp.zero_()
+        self.cur = torch.zeros(n, dtype=torch.long, device=dev)         # captures so far
+        self.in_tol = torch.zeros(n, dtype=torch.long, device=dev)      # consecutive steps in radius
+        self.last_pulse = self.t_go.view(-1).clone()                    # go time of the live reach
+        self.bounds = torch.full((n, R), self.T, dtype=torch.long, device=dev)  # T = never captured
+        self.timeouts = torch.zeros(n, R, dtype=torch.bool, device=dev)
+
+    @torch.no_grad()
+    def step(self, s, pos):
+        task, n, R = self.task, self.n, self.R
+        rows = torch.arange(n, device=pos.device)
+        t_delay, t_go = self.t_delay.view(-1), self.t_go.view(-1)
+
+        # -- capture check against the hand's true position at the end of step s-1 --------
+        live = (s >= t_go) & (self.cur < R) & ~self.nogo
+        tgt = self.targets[rows, self.cur.clamp(max=R - 1)]             # (n, 2)
+        inside = ((pos.detach() - tgt) ** 2).sum(-1) < task.capture_radius ** 2
+        self.in_tol = torch.where(inside & live, self.in_tol + 1, torch.zeros_like(self.in_tol))
+        held = self.in_tol >= task.capture_hold_steps
+        timed_out = (s - self.last_pulse) >= task.reach_timeout_steps
+        captured = live & (held | timed_out)
+        if bool(captured.any()):
+            k = self.cur[captured]
+            self.bounds[rows[captured], k] = s
+            self.timeouts[rows[captured], k] = (timed_out & ~held)[captured]
+            self.cur = self.cur + captured.long()
+            self.last_pulse = torch.where(captured, torch.full_like(self.last_pulse, s),
+                                          self.last_pulse)
+            self.in_tol = torch.where(captured, torch.zeros_like(self.in_tol), self.in_tol)
+
+        # -- instruction row for step s (after any capture, like the scripted `cur`) -------
+        live = (s >= t_go) & (self.cur < R) & ~self.nogo
+        cur_eff = torch.where(self.nogo, torch.zeros_like(self.cur), self.cur)
+        go = live if self.pulse is None else live & ((s - self.last_pulse) < self.pulse)
+        self.inp[:, s, :] = task._instruction(cur_eff.unsqueeze(1), (s >= t_delay).unsqueeze(1),
+                                              go.unsqueeze(1), self.targets, self.horizon)[:, 0]
+
+    def finalize(self):
+        """(desired, timestamps) from the capture times realized during the rollout."""
+        pulse_times = torch.cat([self.t_go, self.bounds[:, :-1]], dim=1)     # (n, R)
+        no_go_reach = torch.full((self.n,), -1, dtype=torch.long, device=self.targets.device)
+        desired, timestamps = self.task._outputs(self.start, self.targets, self.t_delay,
+                                                 self.t_go, self.bounds, pulse_times,
+                                                 self.horizon, self.nogo, no_go_reach, self.T)
+        timestamps['timeouts'] = self.timeouts       # (n, R) reach was force-advanced, not captured
+        return desired, timestamps
+
+
+def rollout_batch(effector, controller, batch, **rollout_kwargs):
+    """Roll out a make_batch() result on `controller`, hiding the scripted/contingent split.
+
+    Returns (states, desired, timestamps). For a contingent HorizonSequence batch the
+    instruction stream is generated inside the rollout and `desired` / timestamps only exist
+    afterwards, so callers must use the returned values rather than the batch's own (which are
+    None / the stepper). The batch can be rolled out repeatedly (e.g. a fixed eval set).
+    """
+    theta0, inp, desired, pert, ts = batch
+    if isinstance(ts, ContingentStepper):
+        ts.reset()
+        states = effector.rollout(controller, theta0, inp, pert, task_step=ts.step, **rollout_kwargs)
+        desired, ts = ts.finalize()
+    else:
+        states = effector.rollout(controller, theta0, inp, pert, **rollout_kwargs)
+    return states, desired, ts
 
 
 class _HoldPostureBase:

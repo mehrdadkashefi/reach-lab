@@ -12,7 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from effectors import make_effector
-from tasks import make_task, TASKS, task_input_channels
+from tasks import make_task, TASKS, task_input_channels, rollout_batch
 from controllers import GRUController, ModularGRU
 
 from utils import fig_reaches, fig_diagnostics, fig_learning_curve
@@ -149,6 +149,17 @@ p.add_argument("--horizon-probs",  type=list_of_float, default=None,
 p.add_argument("--prob-no-go-reach", type=float,     default=None,
                help="fraction of trials where one random reach gets no go pulse "
                     "(the hand holds through that segment; the sequence resumes after)")
+p.add_argument("--capture-mode", choices=["scripted", "contingent"], default="scripted",
+               help="horizon_sequence: 'scripted' captures each target at a pre-sampled time "
+                    "(dwell-range-ms) wherever the hand is; 'contingent' captures only once the "
+                    "hand has stayed within --capture-radius-cm of it for --capture-hold-ms "
+                    "(closed loop), force-advancing after --reach-timeout-ms")
+p.add_argument("--capture-radius-cm", type=float, default=1.0)
+p.add_argument("--capture-hold-ms",   type=float, default=300)
+p.add_argument("--reach-timeout-ms",  type=float, default=800)
+p.add_argument("--init-from", default=None,
+               help="path to a controller_*.pt state dict to warm-start from (same "
+                    "architecture); e.g. fine-tune an existing network on a modified task")
 # --- controller config ---
 p.add_argument("--hidden-dim", type=int, default=128, help="baseline gru hidden size")
 # modular overrides: leave as None to use ModularGRU's own defaults
@@ -239,6 +250,8 @@ elif args.task == "horizon_sequence":
     if args.horizon_probs    is not None: sk['horizon_probs']    = tuple(args.horizon_probs)
     if args.prob_no_go       is not None: sk['prob_no_go']       = args.prob_no_go
     if args.prob_no_go_reach is not None: sk['prob_no_go_reach'] = args.prob_no_go_reach
+    sk.update(capture_mode=args.capture_mode, capture_radius_cm=args.capture_radius_cm,
+              capture_hold_ms=args.capture_hold_ms, reach_timeout_ms=args.reach_timeout_ms)
     task = make_task(args.task, eff, **sk)
 else:
     raise ValueError(f"Invalid task: {args.task}")
@@ -268,6 +281,9 @@ else:
     print(f"controller: modular GRU (H={controller.hidden_dim}) | "
           f"mask density  input {di:.2f}  recurrent {dh:.2f}  output {do:.2f}")
 controller = controller.to(device)
+if args.init_from:
+    controller.load_state_dict(torch.load(args.init_from, map_location=device))
+    print(f"warm start: loaded weights from {args.init_from}")
 
 opt = torch.optim.Adam(controller.parameters(), lr=args.lr)
 mse = nn.MSELoss()
@@ -287,7 +303,8 @@ _saved = {}
 for _attr in ('perturb_prob', 'catch_prob', 'prob_catch'):
     if hasattr(task, _attr):
         _saved[_attr] = getattr(task, _attr); setattr(task, _attr, 0.0)
-eval_theta0, eval_inp, eval_desired, eval_perturbation, eval_timestamps = task.make_batch(num_eval)
+eval_batch = task.make_batch(num_eval)
+eval_inp = eval_batch[1]          # for a contingent task this is filled in during each rollout
 for _attr, _val in _saved.items():
     setattr(task, _attr, _val)
 torch.manual_seed(args.seed)
@@ -298,10 +315,9 @@ loss_hist, snapshots = [], []
 best_err = float('inf')                                   # lowest eval endpoint error so far
 best_path = out(f"controller_{args.effector}_{args.arch}_best.pt")
 for i in tqdm(range(args.n_batch)):
-    theta0, inp, desired, perturbation, ts = task.make_batch(args.batch_size)
-    states = eff.rollout(controller, theta0, inp, perturbation,
-                         obs_noise=args.obs_noise, neural_noise=args.neural_noise,
-                         action_noise=args.action_noise)
+    states, desired, ts = rollout_batch(eff, controller, task.make_batch(args.batch_size),
+                                        obs_noise=args.obs_noise, neural_noise=args.neural_noise,
+                                        action_noise=args.action_noise)
 
     # main tracking loss: force (isometric pacman) vs position (all other tasks). `desired` is a
     # target FORCE for the force task and a target POSITION otherwise; states.force / states.pos
@@ -408,7 +424,7 @@ for i in tqdm(range(args.n_batch)):
     if (i + 1) % args.snap_every == 0:
         controller.eval()
         with torch.no_grad():
-            ev = eff.rollout(controller, eval_theta0, eval_inp, eval_perturbation)
+            ev, eval_desired, _ = rollout_batch(eff, controller, eval_batch)
         controller.train()
         if IS_FORCE_TASK:
             # force error (N), averaged over the whole trial
@@ -444,7 +460,7 @@ lc = fig_learning_curve(loss_hist, f'learning curve ({tag})')
 # Final Evaluation
 controller.eval()
 with torch.no_grad():
-    ev = eff.rollout(controller, eval_theta0, eval_inp, eval_perturbation)
+    ev, eval_desired, _ = rollout_batch(eff, controller, eval_batch)
 if IS_FORCE_TASK:
     td = fig_diagnostics(eff, ev, eval_inp, eval_desired, title=f"Sample force trials ({tag})", num_trial=5)
 else:

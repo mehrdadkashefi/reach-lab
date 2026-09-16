@@ -132,8 +132,16 @@ class Effector:
 
     # --- generic simulation with delayed visual + proprioceptive feedback ---
     def rollout(self, controller, theta0, inp, perturbation=None,
-                obs_noise=0.0, neural_noise=0.0, action_noise=0.0):
+                obs_noise=0.0, neural_noise=0.0, action_noise=0.0, task_step=None):
         """perturbation: optional (batch, steps, perturbation_dim) external force/torque, or None.
+
+        task_step:    optional closed-loop hook `task_step(s, pos)` called at the top of every
+                      step with the hand's true position at the end of the previous step
+                      ((batch, 2); the start posture at s = 0). It is expected to write row
+                      `inp[:, s, :]` in place -- e.g. a task whose target-capture depends on
+                      where the hand actually is, so the instruction stream cannot be built
+                      ahead of time. The controller still reads `inp` through the visual
+                      delay below, so row s is filled `vis_d` steps before it is ever seen.
 
         obs_noise:    std of i.i.d. Gaussian noise added to the *observed* inputs each step:
                       the instruction / visual target (target xy + visibility & go cues), the
@@ -163,6 +171,8 @@ class Effector:
         pro_h = torch.zeros(b, steps, self.proprio_dim, device=dev)
         h_hist = torch.zeros(b, steps, controller.hidden_dim, device=dev)
         for s in range(steps):
+            if task_step is not None:
+                task_step(s, hist['pos'][:, s - 1, :] if s > 0 else fb0['fingertip'])
             # visual channel (70 ms): instruction + fingertip
             if s >= vis_d:
                 inp_v = inp[:, s - vis_d, :]; ft_v = hist['pos'][:, s - vis_d, :]

@@ -52,7 +52,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from effectors import make_effector
-from tasks import make_task, TASKS, task_input_channels, PacManTask
+from tasks import make_task, TASKS, task_input_channels, PacManTask, rollout_batch
 from controllers import GRUController, ModularGRU
 from utils import fig_reaches, fig_diagnostics
 
@@ -119,6 +119,8 @@ def build_task(cfg, effector):
         if cfg.get("horizon_probs")    is not None: kw["horizon_probs"]    = tuple(cfg["horizon_probs"])
         if cfg.get("prob_no_go")       is not None: kw["prob_no_go"]       = cfg["prob_no_go"]
         if cfg.get("prob_no_go_reach") is not None: kw["prob_no_go_reach"] = cfg["prob_no_go_reach"]
+        for k in ("capture_mode", "capture_radius_cm", "capture_hold_ms", "reach_timeout_ms"):
+            if cfg.get(k) is not None: kw[k] = cfg[k]
         return make_task(name, effector, **kw)
     elif name == "pursuit":
         kw = {"unified_input": unified, "go_pulse_ms": go_pulse_ms}
@@ -259,11 +261,11 @@ def rollout_experiment(folder, n=5, task=None, spec=None, device="cpu", seed=0,
               + f" | effector {eff.name}{' (isometric)' if eff.isometric else ''}")
 
     torch.manual_seed(seed)
-    theta0, inp, desired, pert, ts = (tsk.make_batch(spec=spec) if spec is not None
-                                      else tsk.make_batch(n))
+    batch = tsk.make_batch(spec=spec) if spec is not None else tsk.make_batch(n)
+    theta0, inp, _, pert, _ = batch
     with torch.no_grad():
-        states = eff.rollout(controller, theta0, inp, pert,
-                             obs_noise=obs_noise, neural_noise=neural_noise)
+        states, desired, ts = rollout_batch(eff, controller, batch,
+                                            obs_noise=obs_noise, neural_noise=neural_noise)
     extras = {'controller': controller, 'task': tsk, 'cfg': cfg,
               'theta0': theta0, 'perturbation': pert, 'timestamps': ts}
     return eff, states, inp, desired, extras
@@ -732,11 +734,12 @@ def _run_one_spec(folder, name, spec, eff, controller, task, cfg,
                   obs_noise, neural_noise, num_plot, seed):
     """Roll out a single named spec and save figures + arrays under <folder>/test/<name>/."""
     torch.manual_seed(seed)
-    theta0, inp, desired, pert, ts = task.make_batch(spec=spec)
+    batch = task.make_batch(spec=spec)
+    theta0, inp, _, pert, _ = batch
 
     with torch.no_grad():
-        states = eff.rollout(controller, theta0, inp, pert,
-                             obs_noise=obs_noise, neural_noise=neural_noise)
+        states, desired, ts = rollout_batch(eff, controller, batch,
+                                            obs_noise=obs_noise, neural_noise=neural_noise)
 
     is_force = getattr(task, "is_force_task", False)
     out_dir = os.path.join(folder, "test", name)
