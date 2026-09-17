@@ -66,6 +66,20 @@ p.add_argument("--w-loss-blind-hold", type=float, default=0.0,
 # target first becomes visible to the target itself, clamped at 0 (that gap is only guaranteed
 # non-negative once the arm actually reaches the target -- see the clamp comment at the loss
 # itself for why). 0 = off.
+# urgency: time pressure. Distance to the currently-live target, weighted by a ramp
+# u = 1 - exp(-(t - onset)/tau) that starts at 0 when the target becomes actionable (its go-pulse,
+# plus the sensory-blind shift for an unpreviewed reach) and rises the longer it stays
+# uncaptured. Position loss alone barely rewards capturing *sooner* -- a hand that arrives late
+# but holds costs almost the same as one that arrives early -- so nothing pushes the network to
+# exploit a preview. This is the analog of reward rate in the animal task. A first attempt at this
+# term under scripted capture was reverted: sweeping past the target satisfied it. Under
+# contingent capture that loophole is gone (sweeping doesn't capture, leaving early stalls the
+# trial), which is what makes it viable now. 0 = off.
+p.add_argument("--w-loss-urgency", type=float, default=0.0,
+               help="weight on the time-rising penalty of distance to the live target "
+                    "(see comment). 0 = off (default)")
+p.add_argument("--urgency-tau-ms", type=float, default=300.0,
+               help="time constant (ms) of the urgency ramp; smaller = pressure builds sooner")
 p.add_argument("--w-loss-path-length", type=float, default=0.0,
                help="weight on reach 0's excess path length (arc length beyond the straight-line "
                     "distance to its own target, over [delay_start, capture0]). 0 = off (default)")
@@ -368,6 +382,29 @@ for i in tqdm(range(args.n_batch)):
     else:
         loss_blind_hold = torch.zeros((), device=device)
 
+    # urgency: ramp-weighted distance to the live target, per reach window -- see arg help above.
+    if args.w_loss_urgency > 0 and isinstance(ts, dict) and 'unpreviewed' in ts:
+        move_start = ts['move_start'].to(device)                            # (n,)
+        capture = ts['capture_times'].to(device)                           # (n, R)
+        unpv = ts['unpreviewed'].to(device)                                 # (n, R)
+        n_, R_ = capture.shape
+        pulse = torch.cat([move_start.unsqueeze(1), capture[:, :-1]], dim=1)  # (n, R) go of reach k
+        blind = task.blind_steps if getattr(task, 'blind_mode', None) == 'delay' else 0
+        onsets = pulse + blind * unpv.long()                                # when target k is actionable
+        ends = torch.cat([onsets[:, 1:], capture[:, -1:]], dim=1)          # ... until the next one is
+        Tt = torch.arange(states.pos.shape[1], device=device).unsqueeze(0)  # (1, T)
+        tau_u = max(1.0, args.urgency_tau_ms / 1000.0 / args.dt)
+        u = torch.zeros(n_, states.pos.shape[1], device=device)
+        for k in range(R_):
+            pk, ek = onsets[:, k:k + 1], ends[:, k:k + 1]
+            active = (Tt >= pk) & (Tt < ek)
+            u = u + (1.0 - torch.exp(-(Tt - pk).clamp(min=0).float() / tau_u)) * active.float()
+        if 'is_no_go' in ts:
+            u = u * (~ts['is_no_go'].to(device)).float().unsqueeze(1)
+        loss_urgency = (_err * u).sum() / u.sum().clamp(min=1.0)
+    else:
+        loss_urgency = torch.zeros((), device=device)
+
     # straight-line: penalize reach 0's excess path length -- see arg help above. Arc length is
     # the Riemann-sum integral of speed (states.vel is already a physics output, no need to
     # difference positions or shift indices by one step).
@@ -404,6 +441,7 @@ for i in tqdm(range(args.n_batch)):
             + args.w_loss_action * loss_action + args.w_loss_action_diff * loss_action_diff
             + args.w_loss_hidden * loss_hidden + args.w_loss_hidden_diff * loss_hidden_diff
             + args.w_loss_blind_hold * loss_blind_hold
+            + args.w_loss_urgency * loss_urgency
             + args.w_loss_path_length * loss_path_length)
 
     opt.zero_grad()
@@ -417,6 +455,7 @@ for i in tqdm(range(args.n_batch)):
             'muscle': args.w_loss_action * loss_action, 'muscle_diff': args.w_loss_action_diff * loss_action_diff, 'hidden':args.w_loss_hidden * loss_hidden,
             'hidden_diff':  args.w_loss_hidden_diff * loss_hidden_diff,
             'blind_hold': args.w_loss_blind_hold * loss_blind_hold,
+            'urgency': args.w_loss_urgency * loss_urgency,
             'path_length': args.w_loss_path_length * loss_path_length }
 
         wandb.log({f'{k}': v.item() for k, v in contrib.items()}, step=i)
