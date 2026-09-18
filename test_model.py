@@ -121,6 +121,8 @@ def build_task(cfg, effector):
         if cfg.get("prob_no_go_reach") is not None: kw["prob_no_go_reach"] = cfg["prob_no_go_reach"]
         for k in ("capture_mode", "capture_radius_cm", "capture_hold_ms", "reach_timeout_ms"):
             if cfg.get(k) is not None: kw[k] = cfg[k]
+        if cfg.get("reach_timeout_range_ms") is not None:
+            kw["reach_timeout_range_ms"] = tuple(cfg["reach_timeout_range_ms"])
         return make_task(name, effector, **kw)
     elif name == "pursuit":
         kw = {"unified_input": unified, "go_pulse_ms": go_pulse_ms}

@@ -171,6 +171,12 @@ p.add_argument("--capture-mode", choices=["scripted", "contingent"], default="sc
 p.add_argument("--capture-radius-cm", type=float, default=1.0)
 p.add_argument("--capture-hold-ms",   type=float, default=300)
 p.add_argument("--reach-timeout-ms",  type=float, default=800)
+p.add_argument("--reach-timeout-range-ms", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+               help="sample the force-advance deadline per (trial, reach) in [LO, HI] instead of "
+                    "using a single --reach-timeout-ms. Until the net can actually capture, every "
+                    "reach runs to its deadline, so a fixed value pins every reach onset to the "
+                    "clock and removes the timing jitter scripted mode gets from its random dwell "
+                    "-- which is what stalls from-scratch training. Overrides --reach-timeout-ms.")
 p.add_argument("--init-from", default=None,
                help="path to a controller_*.pt state dict to warm-start from (same "
                     "architecture); e.g. fine-tune an existing network on a modified task")
@@ -265,7 +271,9 @@ elif args.task == "horizon_sequence":
     if args.prob_no_go       is not None: sk['prob_no_go']       = args.prob_no_go
     if args.prob_no_go_reach is not None: sk['prob_no_go_reach'] = args.prob_no_go_reach
     sk.update(capture_mode=args.capture_mode, capture_radius_cm=args.capture_radius_cm,
-              capture_hold_ms=args.capture_hold_ms, reach_timeout_ms=args.reach_timeout_ms)
+              capture_hold_ms=args.capture_hold_ms, reach_timeout_ms=args.reach_timeout_ms,
+              reach_timeout_range_ms=(tuple(args.reach_timeout_range_ms)
+                                      if args.reach_timeout_range_ms is not None else None))
     task = make_task(args.task, eff, **sk)
 else:
     raise ValueError(f"Invalid task: {args.task}")

@@ -439,7 +439,7 @@ class HorizonSequence:
                  desired_profile='step', mj_move_steps=30, go_pulse_ms=150,
                  blind_mode='delay', blind_ms=None,
                  capture_mode='scripted', capture_radius_cm=1.0, capture_hold_ms=300,
-                 reach_timeout_ms=800,
+                 reach_timeout_ms=800, reach_timeout_range_ms=None,
                  perturb_prob=0.0, perturb_mag=0.0, perturb_dur_ms=100, **kwargs):
         self.effector = effector
         # How a target gets captured (and the next reach cued):
@@ -456,6 +456,21 @@ class HorizonSequence:
         self.capture_radius = capture_radius_cm / 100.0
         self.capture_hold_steps = ms2steps(capture_hold_ms)
         self.reach_timeout_steps = ms2steps(reach_timeout_ms)
+        # Force-advance deadline. A *range* samples it independently per (trial, reach), which
+        # is what keeps the schedule unpredictable while the net is still too poor to capture
+        # anything: with a single fixed deadline every reach lasts exactly reach_timeout_ms, so
+        # reach onsets are pinned to the clock and the task loses the timing jitter the scripted
+        # mode gets from its random per-reach dwell. Once capture is reliable the deadline stops
+        # binding and the jitter disappears on its own.
+        if reach_timeout_range_ms is None:
+            self.reach_timeout_lo = self.reach_timeout_hi = self.reach_timeout_steps
+        else:
+            lo, hi = reach_timeout_range_ms
+            self.reach_timeout_lo, self.reach_timeout_hi = ms2steps(lo), ms2steps(hi)
+            assert self.reach_timeout_lo <= self.reach_timeout_hi, \
+                "reach_timeout_range_ms must be (lo, hi)"
+            self.reach_timeout_steps = self.reach_timeout_hi          # worst case for budgeting
+        self.reach_timeout_range_ms = reach_timeout_range_ms
         # How to handle the window after an *unpreviewed* go cue, during which the target has not
         # reached the controller yet (sensory delay):
         #   'delay' : the desired holds at the previous target across the window, so waiting is
@@ -615,8 +630,16 @@ class HorizonSequence:
         if self.contingent:
             assert not (no_go_reach >= 0).any(), \
                 "capture_mode='contingent' does not support no_go_reach yet"
+            if self.reach_timeout_lo == self.reach_timeout_hi:
+                deadline = torch.full((n, R), self.reach_timeout_hi, dtype=torch.long, device=dev)
+            elif spec is None:
+                deadline = torch.randint(self.reach_timeout_lo, self.reach_timeout_hi + 1,
+                                         (n, R), device=dev)
+            else:                                    # specs stay deterministic: use the midpoint
+                deadline = torch.full((n, R), (self.reach_timeout_lo + self.reach_timeout_hi) // 2,
+                                      dtype=torch.long, device=dev)
             stepper = ContingentStepper(self, theta0, start, targets, t_delay, t_go, horizon,
-                                        nogo, pulse, T)
+                                        nogo, pulse, T, deadline)
             return theta0, stepper.inp, None, perturbation, stepper
 
         bounds = t_go + dseg.cumsum(1)                                  # (n, R) capture times
@@ -800,12 +823,18 @@ class ContingentStepper:
     scripted capture does.
     """
 
-    def __init__(self, task, theta0, start, targets, t_delay, t_go, horizon, nogo, pulse, T):
+    def __init__(self, task, theta0, start, targets, t_delay, t_go, horizon, nogo, pulse, T,
+                 deadline=None):
         self.task = task
         self.theta0, self.start, self.targets = theta0, start, targets      # targets (n, R, 2)
         self.t_delay, self.t_go = t_delay, t_go                             # (n, 1)
         self.horizon, self.nogo, self.pulse, self.T = horizon, nogo, pulse, T
         self.n, self.R = targets.shape[:2]
+        # per-(trial, reach) force-advance deadline in steps; constant unless the task was given
+        # a reach_timeout_range_ms
+        self.deadline = (torch.full((self.n, self.R), task.reach_timeout_steps,
+                                    dtype=torch.long, device=targets.device)
+                         if deadline is None else deadline)
         self.inp = torch.zeros(self.n, T, task.input_channels, device=targets.device)
         self.reset()
 
@@ -830,7 +859,7 @@ class ContingentStepper:
         inside = ((pos.detach() - tgt) ** 2).sum(-1) < task.capture_radius ** 2
         self.in_tol = torch.where(inside & live, self.in_tol + 1, torch.zeros_like(self.in_tol))
         held = self.in_tol >= task.capture_hold_steps
-        timed_out = (s - self.last_pulse) >= task.reach_timeout_steps
+        timed_out = (s - self.last_pulse) >= self.deadline[rows, self.cur.clamp(max=R - 1)]
         captured = live & (held | timed_out)
         if bool(captured.any()):
             k = self.cur[captured]
