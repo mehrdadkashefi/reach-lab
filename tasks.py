@@ -433,6 +433,7 @@ class HorizonSequence:
 
     def __init__(self, effector, n_reaches=7,
                  init_range_ms=(300, 700), delay_range_ms=(300, 700),
+                 delay_dist='uniform', delay_tau_ms=400,
                  dwell_range_ms=(400, 600), final_range_ms=(300, 700),
                  horizon_probs=(1/3, 1/3, 1/3),
                  prob_no_go=0.15, prob_no_go_reach=0.0,
@@ -508,6 +509,19 @@ class HorizonSequence:
         self.delay_lo, self.delay_hi = ms2steps(delay_range_ms[0]), ms2steps(delay_range_ms[1])
         self.dwell_lo, self.dwell_hi = ms2steps(dwell_range_ms[0]), ms2steps(dwell_range_ms[1])
         self.final_lo, self.final_hi = ms2steps(final_range_ms[0]), ms2steps(final_range_ms[1])
+        # Shape of the pre-cue delay (target onset -> first go cue). This is the ONLY cue whose
+        # time is drawn from a distribution; every later one is triggered by a capture.
+        #   'uniform'     : the longer the wait, the sooner the cue must come, so a net can beat
+        #                   the task with a fixed timer started at target onset -- which is
+        #                   exactly what runs D and E learned (onset vs delay had slope -1).
+        #   'exponential' : truncated exponential with rate 1/delay_tau, the one shape whose
+        #                   hazard is constant, so waiting tells the network nothing and a timer
+        #                   buys it nothing. Truncation at delay_hi does put a hazard spike at the
+        #                   very end; keep delay_tau well under (delay_hi - delay_lo) so little
+        #                   mass piles up there.
+        assert delay_dist in ('uniform', 'exponential')
+        self.delay_dist = delay_dist
+        self.delay_tau = max(1.0, delay_tau_ms / 1000 / effector.dt)     # steps
         if self.contingent:
             # no-go variants are time-scripted; keep them off until they get a contingent
             # definition of their own
@@ -522,6 +536,17 @@ class HorizonSequence:
     @property
     def contingent(self):
         return self.capture_mode == 'contingent'
+
+    def _sample_delay(self, n, dev):
+        """Pre-cue delay in steps, (n, 1), within [delay_lo, delay_hi]. See delay_dist above."""
+        if self.delay_dist == 'uniform':
+            return torch.randint(self.delay_lo, self.delay_hi + 1, (n, 1), device=dev)
+        # truncated exponential by inverse CDF (exact, no rejection loop)
+        span = self.delay_hi - self.delay_lo
+        z = 1.0 - math.exp(-span / self.delay_tau)
+        u = torch.rand(n, 1, device=dev)
+        d = self.delay_lo - self.delay_tau * torch.log1p(-u * z)
+        return d.round().long().clamp(self.delay_lo, self.delay_hi)
 
     # -- spec helpers ------------------------------------------------------------------
     def _resolve_spec_geometry(self, spec, dev):
@@ -583,7 +608,7 @@ class HorizonSequence:
             targets = eff.joint_to_cart(eff.sample_joint(n * R)).reshape(n, R, 2)
             T = self.steps
             d1   = torch.randint(self.init_lo,  self.init_hi + 1,  (n, 1), device=dev)
-            d2   = torch.randint(self.delay_lo, self.delay_hi + 1, (n, 1), device=dev)
+            d2   = self._sample_delay(n, dev)
             dseg = torch.randint(self.dwell_lo, self.dwell_hi + 1, (n, R), device=dev)
             d4   = torch.randint(self.final_lo, self.final_hi + 1, (n, 1), device=dev)
             if self.contingent:

@@ -150,6 +150,13 @@ p.add_argument("--go-range", type=list_of_int, default=[20, 50], help="delayed_r
 # delayed_reach_posture timing (ms); None -> task defaults
 p.add_argument("--init-range-ms",  type=list_of_int, default=None)
 p.add_argument("--delay-range-ms", type=list_of_int, default=None)
+p.add_argument("--delay-dist", choices=["uniform", "exponential"], default=None,
+               help="shape of the pre-cue delay (target onset -> first go cue). 'uniform' lets a\n"
+                    "fixed timer started at target onset beat the task (runs D/E did exactly that);\n"
+                    "'exponential' has a constant hazard, so waiting predicts nothing.")
+p.add_argument("--delay-tau-ms", type=float, default=None,
+               help="rate parameter of --delay-dist exponential; keep it well under the width of\n"
+                    "--delay-range-ms so little probability mass piles up at the upper bound.")
 p.add_argument("--move-ms",        type=int,         default=None)
 p.add_argument("--final-range-ms", type=list_of_int, default=None)
 p.add_argument("--final-input",    choices=["null", "target"], default=None)
@@ -265,6 +272,8 @@ elif args.task == "horizon_sequence":
     if args.n_reaches        is not None: sk['n_reaches']        = args.n_reaches
     if args.init_range_ms    is not None: sk['init_range_ms']    = tuple(args.init_range_ms)
     if args.delay_range_ms   is not None: sk['delay_range_ms']   = tuple(args.delay_range_ms)
+    if args.delay_dist       is not None: sk['delay_dist']       = args.delay_dist
+    if args.delay_tau_ms     is not None: sk['delay_tau_ms']     = args.delay_tau_ms
     if args.dwell_range_ms   is not None: sk['dwell_range_ms']   = tuple(args.dwell_range_ms)
     if args.final_range_ms   is not None: sk['final_range_ms']   = tuple(args.final_range_ms)
     if args.horizon_probs    is not None: sk['horizon_probs']    = tuple(args.horizon_probs)
