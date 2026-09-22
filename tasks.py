@@ -523,10 +523,20 @@ class HorizonSequence:
         self.delay_dist = delay_dist
         self.delay_tau = max(1.0, delay_tau_ms / 1000 / effector.dt)     # steps
         if self.contingent:
-            # no-go variants are time-scripted; keep them off until they get a contingent
-            # definition of their own
-            assert self.prob_no_go == 0.0 and self.prob_no_go_reach == 0.0, \
-                "capture_mode='contingent' does not support no-go trials yet"
+            # Trial-level no-go IS supported: the stepper guards every capture check and every
+            # go-cue write with ~nogo, so such a trial never goes live, never captures, and
+            # _outputs (cap = 0) holds `desired` at the start posture for the whole episode.
+            # Verified end-to-end: 0 go-cue steps, desired == start exactly, 0 captures, 0
+            # timeout flags, finite gradients.
+            # The *reach-level* skip is the one with no contingent definition: nothing can end a
+            # skipped reach, because the hand is already on the previous target and no new target
+            # is ever cued, so there is no capture event to advance the sequence. It would need a
+            # duration rule of its own (e.g. reuse that reach's sampled deadline, recorded as a
+            # skip rather than a timeout).
+            assert self.prob_no_go_reach == 0.0, \
+                "capture_mode='contingent' does not support reach-level no-go (prob_no_go_reach) " \
+                "yet -- a skipped reach has no capture event to end it. Trial-level no-go " \
+                "(prob_no_go) is supported."
             per_reach = self.reach_timeout_steps          # worst case: every reach times out
         else:
             per_reach = self.dwell_hi
