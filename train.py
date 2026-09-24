@@ -156,6 +156,18 @@ p.add_argument("--final-input",    choices=["null", "target"], default=None)
 p.add_argument("--prob-no-go",     type=float,       default=None, help="fraction of no-go trials")
 # horizon_sequence (also reuses --init/--delay/--final-range-ms and --prob-no-go above)
 p.add_argument("--n-reaches",      type=int,         default=None, help="sequence length (default 7)")
+# Curriculum: train the first --curriculum-batches on a SHORTER sequence, then switch to the full
+# --n-reaches for the rest, in one run. The plateau before the network learns to reach at all lasts
+# ~3-4.5k batches no matter the sequence length, and roughly half of from-scratch runs escape it
+# only part way -- solving x (the wider workspace axis) and parking y. A shorter sequence makes
+# that stretch ~40% cheaper per batch (690 vs 990 steps at R=4 vs 7), so the expensive full-length
+# episodes only start once the network can already reach. The controller is unaffected by sequence
+# length (input is 3 target slots + go regardless), so the switch needs no surgery.
+p.add_argument("--curriculum-reaches", type=int, default=None,
+               help="horizon_sequence only: sequence length to use for the first "
+                    "--curriculum-batches batches, before switching to --n-reaches")
+p.add_argument("--curriculum-batches", type=int, default=0,
+               help="how many batches to spend on --curriculum-reaches before switching")
 p.add_argument("--dwell-range-ms", type=list_of_int, default=None,
                help="per-reach segment duration range (move + hold at target), ms")
 p.add_argument("--horizon-probs",  type=list_of_float, default=None,
@@ -274,6 +286,7 @@ elif args.task == "horizon_sequence":
               capture_hold_ms=args.capture_hold_ms, reach_timeout_ms=args.reach_timeout_ms,
               reach_timeout_range_ms=(tuple(args.reach_timeout_range_ms)
                                       if args.reach_timeout_range_ms is not None else None))
+    _task_kwargs = dict(sk)
     task = make_task(args.task, eff, **sk)
 else:
     raise ValueError(f"Invalid task: {args.task}")
@@ -319,17 +332,36 @@ if args.track:
 # would blank the signal -- the random plant perturbation on the reach tasks, and the no-bump
 # catch fraction on the hold tasks -- so the eval batch is clean and consistent. Only touches
 # whichever of these the task actually has.
-torch.manual_seed(123)
 num_eval = 30
-_saved = {}
-for _attr in ('perturb_prob', 'catch_prob', 'prob_catch'):
-    if hasattr(task, _attr):
-        _saved[_attr] = getattr(task, _attr); setattr(task, _attr, 0.0)
-eval_batch = task.make_batch(num_eval)
+
+
+def make_eval_batch(tk):
+    torch.manual_seed(123)
+    saved = {}
+    for attr in ('perturb_prob', 'catch_prob', 'prob_catch'):
+        if hasattr(tk, attr):
+            saved[attr] = getattr(tk, attr); setattr(tk, attr, 0.0)
+    batch = tk.make_batch(num_eval)
+    for attr, val in saved.items():
+        setattr(tk, attr, val)
+    torch.manual_seed(args.seed)
+    return batch
+
+
+eval_batch = None                 # set below, and again at a curriculum switch
+
+
+# --- curriculum: start on a shorter sequence, switch to the full one part-way through ---
+curriculum_at = 0
+if args.curriculum_reaches is not None and args.curriculum_batches > 0:
+    if args.task != "horizon_sequence":
+        raise ValueError("--curriculum-reaches is only defined for horizon_sequence")
+    full_task, curriculum_at = task, args.curriculum_batches
+    task = make_task(args.task, eff, **{**_task_kwargs, 'n_reaches': args.curriculum_reaches})
+    print(f"curriculum: {args.curriculum_reaches} reaches ({task.steps} steps) for the first "
+          f"{curriculum_at} batches, then {full_task.n_reaches} ({full_task.steps} steps)")
+eval_batch = make_eval_batch(task)
 eval_inp = eval_batch[1]          # for a contingent task this is filled in during each rollout
-for _attr, _val in _saved.items():
-    setattr(task, _attr, _val)
-torch.manual_seed(args.seed)
 
 
 # ----------------------------------------------------------------------------- train
@@ -337,6 +369,12 @@ loss_hist, snapshots = [], []
 best_err = float('inf')                                   # lowest eval endpoint error so far
 best_path = out(f"controller_{args.effector}_{args.arch}_best.pt")
 for i in tqdm(range(args.n_batch)):
+    if curriculum_at and i == curriculum_at:
+        task = full_task
+        eval_batch = make_eval_batch(task)
+        eval_inp = eval_batch[1]
+        tqdm.write(f"curriculum: switching to {task.n_reaches} reaches ({task.steps} steps) "
+                   f"at batch {i}")
     states, desired, ts = rollout_batch(eff, controller, task.make_batch(args.batch_size),
                                         obs_noise=args.obs_noise, neural_noise=args.neural_noise,
                                         action_noise=args.action_noise)
