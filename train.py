@@ -168,6 +168,15 @@ p.add_argument("--curriculum-reaches", type=int, default=None,
                     "--curriculum-batches batches, before switching to --n-reaches")
 p.add_argument("--curriculum-batches", type=int, default=0,
                help="how many batches to spend on --curriculum-reaches before switching")
+p.add_argument("--curriculum-horizon-probs", type=list_of_float, default=None,
+               help="horizon distribution during the curriculum stage (default: same as the full "
+                    "task). Use 1,0,0 to make the short stage horizon-1 only. On a short sequence "
+                    "a horizon of 3 previews nearly the whole trial, so sweeping through targets "
+                    "pays and committing to them does not -- the network learns not to stop, and "
+                    "carries that into the full-length stage (measured: 95%+ of horizon-2/3 "
+                    "reaches then fail to hold their target). Horizon 1 has nothing to sweep "
+                    "toward, so the short stage teaches holding and cue-following only, and the "
+                    "full stage introduces preview to an arm that can already stop.")
 p.add_argument("--dwell-range-ms", type=list_of_int, default=None,
                help="per-reach segment duration range (move + hold at target), ms")
 p.add_argument("--horizon-probs",  type=list_of_float, default=None,
@@ -357,9 +366,14 @@ if args.curriculum_reaches is not None and args.curriculum_batches > 0:
     if args.task != "horizon_sequence":
         raise ValueError("--curriculum-reaches is only defined for horizon_sequence")
     full_task, curriculum_at = task, args.curriculum_batches
-    task = make_task(args.task, eff, **{**_task_kwargs, 'n_reaches': args.curriculum_reaches})
-    print(f"curriculum: {args.curriculum_reaches} reaches ({task.steps} steps) for the first "
-          f"{curriculum_at} batches, then {full_task.n_reaches} ({full_task.steps} steps)")
+    _ckw = {**_task_kwargs, 'n_reaches': args.curriculum_reaches}
+    if args.curriculum_horizon_probs is not None:
+        _ckw['horizon_probs'] = tuple(args.curriculum_horizon_probs)
+    task = make_task(args.task, eff, **_ckw)
+    print(f"curriculum: {args.curriculum_reaches} reaches ({task.steps} steps), horizon_probs "
+          f"{tuple(round(float(x), 3) for x in task.horizon_probs)} for the first {curriculum_at} "
+          f"batches, then {full_task.n_reaches} reaches ({full_task.steps} steps), horizon_probs "
+          f"{tuple(round(float(x), 3) for x in full_task.horizon_probs)}")
 eval_batch = make_eval_batch(task)
 eval_inp = eval_batch[1]          # for a contingent task this is filled in during each rollout
 
