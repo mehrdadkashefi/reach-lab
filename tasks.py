@@ -439,7 +439,7 @@ class HorizonSequence:
                  desired_profile='step', mj_move_steps=30, go_pulse_ms=150,
                  blind_mode='delay', blind_ms=None,
                  capture_mode='scripted', capture_radius_cm=1.0, capture_hold_ms=300,
-                 reach_timeout_ms=800, reach_timeout_range_ms=None,
+                 reach_timeout_ms=800, reach_timeout_range_ms=None, force_advance=True,
                  perturb_prob=0.0, perturb_mag=0.0, perturb_dur_ms=100, **kwargs):
         self.effector = effector
         # How a target gets captured (and the next reach cued):
@@ -471,6 +471,14 @@ class HorizonSequence:
                 "reach_timeout_range_ms must be (lo, hi)"
             self.reach_timeout_steps = self.reach_timeout_hi          # worst case for budgeting
         self.reach_timeout_range_ms = reach_timeout_range_ms
+        # Whether missing the deadline still advances the sequence. True (default) = the old
+        # behaviour: a reach the hand never dwelled on is force-advanced, so flying through a
+        # target costs only (deadline - a normal reach). That is a loophole -- it lets the network
+        # treat pairs of targets as one movement, sweeping through the first at full speed and
+        # collecting it by timeout. An animal cannot do that: no dwell, no progression. False
+        # keeps the target live until it is actually acquired, so the hand must come back, and a
+        # trial that runs out of time simply ends unfinished.
+        self.force_advance = bool(force_advance)
         # How to handle the window after an *unpreviewed* go cue, during which the target has not
         # reached the controller yet (sensory delay):
         #   'delay' : the desired holds at the previous target across the window, so waiting is
@@ -870,7 +878,7 @@ class ContingentStepper:
         self.in_tol = torch.where(inside & live, self.in_tol + 1, torch.zeros_like(self.in_tol))
         held = self.in_tol >= task.capture_hold_steps
         timed_out = (s - self.last_pulse) >= self.deadline[rows, self.cur.clamp(max=R - 1)]
-        captured = live & (held | timed_out)
+        captured = live & (held | (timed_out & self.task.force_advance))
         if bool(captured.any()):
             k = self.cur[captured]
             self.bounds[rows[captured], k] = s

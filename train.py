@@ -192,6 +192,14 @@ p.add_argument("--capture-mode", choices=["scripted", "contingent"], default="sc
 p.add_argument("--capture-radius-cm", type=float, default=1.0)
 p.add_argument("--capture-hold-ms",   type=float, default=300)
 p.add_argument("--reach-timeout-ms",  type=float, default=800)
+p.add_argument("--no-force-advance", action="store_true",
+               help="a reach the hand never dwelled on is NOT advanced: the target stays live for "
+                    "the rest of the trial and the hand has to come back. Default (off) force-"
+                    "advances at the deadline, which lets the network treat pairs of targets as "
+                    "one movement -- sweeping through the first at full speed and collecting it by "
+                    "timeout. Measured in run J: at horizon 2/3 the hand passes the odd targets at "
+                    "0.09-0.12 m/s, at or above its own mean peak speed, and never returns to rest "
+                    "anywhere in the sequence. With this flag the deadline only sizes the episode.")
 p.add_argument("--reach-timeout-range-ms", type=float, nargs=2, default=None, metavar=("LO", "HI"),
                help="sample the force-advance deadline per (trial, reach) in [LO, HI] instead of "
                     "using a single --reach-timeout-ms. Until the net can actually capture, every "
@@ -294,7 +302,8 @@ elif args.task == "horizon_sequence":
     sk.update(capture_mode=args.capture_mode, capture_radius_cm=args.capture_radius_cm,
               capture_hold_ms=args.capture_hold_ms, reach_timeout_ms=args.reach_timeout_ms,
               reach_timeout_range_ms=(tuple(args.reach_timeout_range_ms)
-                                      if args.reach_timeout_range_ms is not None else None))
+                                      if args.reach_timeout_range_ms is not None else None),
+              force_advance=not args.no_force_advance)
     _task_kwargs = dict(sk)
     task = make_task(args.task, eff, **sk)
 else:
