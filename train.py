@@ -100,6 +100,10 @@ p.add_argument("--perturb-mag", type=float, default=0.0,
 p.add_argument("--perturb-dur-ms", type=float, default=100,
                help="duration (ms) of each perturbation pulse")
 p.add_argument("--snap-every", type=int, default=100)
+p.add_argument("--ckpt-every", type=int, default=0,
+               help="also save the controller every N batches to <run>/ckpts/, so behaviour can be "
+                    "tracked over training rather than only at the end. 0 = off. Kept in a "
+                    "subfolder so test_model's controller_*.pt lookup never picks one up.")
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--track", action="store_true", help="log metrics to Weights & Biases")
 p.add_argument("--wandb-project", default="arm-rnn")
@@ -398,6 +402,10 @@ for i in tqdm(range(args.n_batch)):
         eval_inp = eval_batch[1]
         tqdm.write(f"curriculum: switching to {task.n_reaches} reaches ({task.steps} steps) "
                    f"at batch {i}")
+        # the eval batch just changed, so errors before and after are not comparable. Without
+        # this reset a short-sequence checkpoint can keep the "best" slot for the rest of the run,
+        # and anything evaluating _best.pt would silently test a stage-1 model.
+        best_err = float('inf')
     states, desired, ts = rollout_batch(eff, controller, task.make_batch(args.batch_size),
                                         obs_noise=args.obs_noise, neural_noise=args.neural_noise,
                                         action_noise=args.action_noise)
@@ -528,6 +536,10 @@ for i in tqdm(range(args.n_batch)):
             'path_length': args.w_loss_path_length * loss_path_length }
 
         wandb.log({f'{k}': v.item() for k, v in contrib.items()}, step=i)
+
+    if args.ckpt_every and (i + 1) % args.ckpt_every == 0:
+        os.makedirs(out("ckpts"), exist_ok=True)
+        torch.save(controller.state_dict(), out(f"ckpts/controller_step{i + 1:06d}.pt"))
 
     if (i + 1) % args.snap_every == 0:
         controller.eval()
