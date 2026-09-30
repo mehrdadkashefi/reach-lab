@@ -440,6 +440,7 @@ class HorizonSequence:
                  blind_mode='delay', blind_ms=None,
                  capture_mode='scripted', capture_radius_cm=1.0, capture_hold_ms=300,
                  reach_timeout_ms=800, reach_timeout_range_ms=None, force_advance=True,
+                 target_noise_cm=0.0,
                  perturb_prob=0.0, perturb_mag=0.0, perturb_dur_ms=100, **kwargs):
         self.effector = effector
         # How a target gets captured (and the next reach cued):
@@ -479,6 +480,15 @@ class HorizonSequence:
         # keeps the target live until it is actually acquired, so the hand must come back, and a
         # trial that runs out of time simply ends unfinished.
         self.force_advance = bool(force_advance)
+        # Sensory uncertainty about WHERE the targets are: fresh Gaussian noise (std
+        # target_noise_cm, independent per step, per slot, per axis) on the coordinates of every
+        # lit slot. The on flags and the go cue stay exact. Without it the network reads a
+        # target's position perfectly the instant it appears, so it has no preparation cost and a
+        # preview buys it almost nothing -- under honest acquisition it re-initiates ~100 ms after
+        # every capture at every horizon, and reach 1 is no faster than mid-sequence. With noise, a
+        # precise estimate takes integration time, so a target seen in advance (target 0 over the
+        # delay, or a previewed next target) can be acted on sooner than one that just appeared.
+        self.target_noise = float(target_noise_cm) / 100.0
         # How to handle the window after an *unpreviewed* go cue, during which the target has not
         # reached the controller yet (sensory delay):
         #   'delay' : the desired holds at the previous target across the window, so waiting is
@@ -717,8 +727,12 @@ class HorizonSequence:
             idx = cur_eff + j                                           # target index in slot j
             on = (idx < R) & (j < horizon.view(n, 1)) & shown
             idxc = idx.clamp(max=R - 1)
-            inp[:, :, 3 * j]     = tx.gather(1, idxc) * on.float()
-            inp[:, :, 3 * j + 1] = ty.gather(1, idxc) * on.float()
+            x, y = tx.gather(1, idxc), ty.gather(1, idxc)
+            if self.target_noise > 0:
+                x = x + self.target_noise * torch.randn_like(x)
+                y = y + self.target_noise * torch.randn_like(y)
+            inp[:, :, 3 * j]     = x * on.float()
+            inp[:, :, 3 * j + 1] = y * on.float()
             inp[:, :, 3 * j + 2] = on.float()
         inp[:, :, 3 * self.n_slots] = go.float()
         return inp

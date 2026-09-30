@@ -196,6 +196,11 @@ p.add_argument("--capture-mode", choices=["scripted", "contingent"], default="sc
 p.add_argument("--capture-radius-cm", type=float, default=1.0)
 p.add_argument("--capture-hold-ms",   type=float, default=300)
 p.add_argument("--reach-timeout-ms",  type=float, default=800)
+p.add_argument("--target-noise-cm", type=float, default=0.0,
+               help="std (cm) of fresh per-step Gaussian noise on the displayed coordinates of every "
+                    "lit target slot (go cue and on-flags stay exact). Makes target location "
+                    "uncertain so that a precise estimate needs integration time, which gives a "
+                    "preview a real preparation benefit. 0 = off.")
 p.add_argument("--no-force-advance", action="store_true",
                help="a reach the hand never dwelled on is NOT advanced: the target stays live for "
                     "the rest of the trial and the hand has to come back. Default (off) force-"
@@ -307,7 +312,8 @@ elif args.task == "horizon_sequence":
               capture_hold_ms=args.capture_hold_ms, reach_timeout_ms=args.reach_timeout_ms,
               reach_timeout_range_ms=(tuple(args.reach_timeout_range_ms)
                                       if args.reach_timeout_range_ms is not None else None),
-              force_advance=not args.no_force_advance)
+              force_advance=not args.no_force_advance,
+              target_noise_cm=args.target_noise_cm)
     _task_kwargs = dict(sk)
     task = make_task(args.task, eff, **sk)
 else:

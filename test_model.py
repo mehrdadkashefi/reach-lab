@@ -121,6 +121,8 @@ def build_task(cfg, effector):
         if cfg.get("prob_no_go_reach") is not None: kw["prob_no_go_reach"] = cfg["prob_no_go_reach"]
         for k in ("capture_mode", "capture_radius_cm", "capture_hold_ms", "reach_timeout_ms"):
             if cfg.get(k) is not None: kw[k] = cfg[k]
+        if cfg.get("target_noise_cm") is not None:
+            kw["target_noise_cm"] = cfg["target_noise_cm"]
         if cfg.get("no_force_advance") is not None:
             kw["force_advance"] = not cfg["no_force_advance"]
         if cfg.get("reach_timeout_range_ms") is not None:
