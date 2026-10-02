@@ -196,6 +196,11 @@ p.add_argument("--capture-mode", choices=["scripted", "contingent"], default="sc
 p.add_argument("--capture-radius-cm", type=float, default=1.0)
 p.add_argument("--capture-hold-ms",   type=float, default=300)
 p.add_argument("--reach-timeout-ms",  type=float, default=800)
+p.add_argument("--reach-len-range-cm", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+               help="make each training trial a random walk with every reach between LO and HI cm "
+                    "long, instead of drawing targets independently over the workspace (median "
+                    "reach ~27 cm). Matches training to the 4.7 cm grid the models are tested on, "
+                    "and makes target noise large relative to reach length.")
 p.add_argument("--target-noise-cm", type=float, default=0.0,
                help="std (cm) of fresh per-step Gaussian noise on the displayed coordinates of every "
                     "lit target slot (go cue and on-flags stay exact). Makes target location "
@@ -313,7 +318,9 @@ elif args.task == "horizon_sequence":
               reach_timeout_range_ms=(tuple(args.reach_timeout_range_ms)
                                       if args.reach_timeout_range_ms is not None else None),
               force_advance=not args.no_force_advance,
-              target_noise_cm=args.target_noise_cm)
+              target_noise_cm=args.target_noise_cm,
+              reach_len_range_cm=(tuple(args.reach_len_range_cm)
+                                  if args.reach_len_range_cm is not None else None))
     _task_kwargs = dict(sk)
     task = make_task(args.task, eff, **sk)
 else:

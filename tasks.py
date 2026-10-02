@@ -440,7 +440,7 @@ class HorizonSequence:
                  blind_mode='delay', blind_ms=None,
                  capture_mode='scripted', capture_radius_cm=1.0, capture_hold_ms=300,
                  reach_timeout_ms=800, reach_timeout_range_ms=None, force_advance=True,
-                 target_noise_cm=0.0,
+                 target_noise_cm=0.0, reach_len_range_cm=None,
                  perturb_prob=0.0, perturb_mag=0.0, perturb_dur_ms=100, **kwargs):
         self.effector = effector
         # How a target gets captured (and the next reach cued):
@@ -489,6 +489,16 @@ class HorizonSequence:
         # precise estimate takes integration time, so a target seen in advance (target 0 over the
         # delay, or a previewed next target) can be acted on sooner than one that just appeared.
         self.target_noise = float(target_noise_cm) / 100.0
+        # Length of each reach in RANDOM (training) batches. None = every target drawn independently
+        # over the whole workspace, which makes the median reach ~27 cm -- nearly six times the
+        # 4.7 cm neighbour steps of the grid the models are tested on. That mismatch matters once
+        # targets are noisy: what makes launching on a first look costly is noise relative to reach
+        # length (2 cm of noise is a 4 deg aiming error on a 27 cm reach but 23 deg on a 4.7 cm
+        # one). (lo, hi) in cm makes each trial a random walk: every target, the first included, lies
+        # between lo and hi from the previous point. Explicit specs are untouched.
+        self.reach_len_range = (None if reach_len_range_cm is None else
+                                (float(reach_len_range_cm[0]) / 100.0,
+                                 float(reach_len_range_cm[1]) / 100.0))
         # How to handle the window after an *unpreviewed* go cue, during which the target has not
         # reached the controller yet (sensory delay):
         #   'delay' : the desired holds at the previous target across the window, so waiting is
@@ -551,6 +561,29 @@ class HorizonSequence:
     def contingent(self):
         return self.capture_mode == 'contingent'
 
+    def _sample_walk_targets(self, theta0, n, R, n_cand=768):
+        """(n, R, 2) targets forming a random walk whose every step length lies in
+        reach_len_range. Candidates are drawn exactly as independent targets are -- uniformly in
+        joint space, so each is reachable by construction -- and one whose distance from the
+        previous point is in range is kept. If a trial has no candidate in range (rare: a point
+        hemmed into a corner), it takes the one that misses the range by least."""
+        eff, dev = self.effector, self.effector.device
+        lo, hi = self.reach_len_range
+        prev = eff.joint_to_cart(theta0)                                # (n, 2)
+        rows = torch.arange(n, device=dev)
+        out = []
+        for _ in range(R):
+            cand = eff.joint_to_cart(eff.sample_joint(n * n_cand)).reshape(n, n_cand, 2)
+            dist = (cand - prev.unsqueeze(1)).norm(dim=-1)              # (n, n_cand)
+            ok = (dist >= lo) & (dist <= hi)
+            miss = torch.where(dist < lo, lo - dist, dist - hi).clamp(min=0)
+            # in-range candidates get a random score in [1, 2); the rest are ranked by how little
+            # they miss, always below any in-range one
+            score = torch.where(ok, 1.0 + torch.rand(n, n_cand, device=dev), -miss)
+            prev = cand[rows, score.argmax(1)]
+            out.append(prev)
+        return torch.stack(out, 1)
+
     # -- spec helpers ------------------------------------------------------------------
     def _resolve_spec_geometry(self, spec, dev):
         """start ((dof,) or (n, dof)) + targets ((n_reaches, 2) or (n, n_reaches, 2)) -> tensors.
@@ -608,7 +641,10 @@ class HorizonSequence:
             if n is None:
                 raise ValueError("make_batch needs either n (random) or spec (explicit)")
             theta0  = eff.sample_joint(n)
-            targets = eff.joint_to_cart(eff.sample_joint(n * R)).reshape(n, R, 2)
+            if self.reach_len_range is None:
+                targets = eff.joint_to_cart(eff.sample_joint(n * R)).reshape(n, R, 2)
+            else:
+                targets = self._sample_walk_targets(theta0, n, R)
             T = self.steps
             d1   = torch.randint(self.init_lo,  self.init_hi + 1,  (n, 1), device=dev)
             d2   = torch.randint(self.delay_lo, self.delay_hi + 1, (n, 1), device=dev)
