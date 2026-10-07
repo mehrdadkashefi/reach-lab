@@ -12,7 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from effectors import make_effector
-from tasks import make_task, TASKS, task_input_channels, rollout_batch
+from tasks import make_task, TASKS, task_input_channels, rollout_batch, reach_time_weights
 from controllers import GRUController, ModularGRU
 
 from utils import fig_reaches, fig_diagnostics, fig_learning_curve
@@ -80,6 +80,54 @@ p.add_argument("--w-loss-urgency", type=float, default=0.0,
                     "(see comment). 0 = off (default)")
 p.add_argument("--urgency-tau-ms", type=float, default=300.0,
                help="time constant (ms) of the urgency ramp; smaller = pressure builds sooner")
+# Position loss shaped like the task's own rules, instead of a constant pull to the target centre:
+#   dead zone : no position cost while the hand is within --pos-deadzone-cm of where it should be.
+#               Being inside the target IS the goal; with a pull to the exact centre the hand keeps
+#               correcting inside the window (it never rests, and with a noisy target it chases the
+#               noise). Paired with --w-loss-vel, resting is then the cheapest thing to do there.
+#   time ramp : outside the dead zone the weight starts at 0 for --pos-grace-ms after a target
+#               becomes current (nobody can react instantly), is 1 until --pos-ramp-start-ms, then
+#               grows by --pos-ramp-per-step every step, up to --pos-ramp-cap. Lost time gets
+#               expensive: without it, a hold that is broken and redone, or a slow final approach,
+#               costs almost nothing because the reference target simply waits. Unlike the old
+#               --w-loss-urgency (a saturating re-weighting, at most ~2x) this keeps growing.
+#   hold      : before the first go cue, on no-go trials and after the last capture the hand is
+#               simply meant to stay put; outside the dead zone those steps weigh --pos-hold-weight.
+# All off by default (deadzone 0, ramp 0, hold weight 1 = the plain L1 loss).
+p.add_argument("--pos-deadzone-cm", type=float, default=0.0,
+               help="no position cost within this distance (cm) of the current target / hold "
+                    "position; use the capture radius. 0 = off (default)")
+p.add_argument("--pos-ramp-per-step", type=float, default=0.0,
+               help="growth of the position weight per step once a target has been current for "
+                    "--pos-ramp-start-ms (0.1 = x10 after one second at dt 10 ms). 0 = off (default)")
+p.add_argument("--pos-ramp-start-ms", type=float, default=100.0,
+               help="the position weight is 1 until this long after a target became current")
+p.add_argument("--pos-grace-ms", type=float, default=50.0,
+               help="the position weight is 0 for this long after a target became current "
+                    "(only when --pos-ramp-per-step > 0)")
+p.add_argument("--pos-ramp-cap", type=float, default=20.0,
+               help="upper bound on the ramped position weight, so a reach that is never "
+                    "completed cannot swamp the batch")
+p.add_argument("--pos-hold-weight", type=float, default=1.0,
+               help="position weight (outside the dead zone) while the hand is meant to stay put: "
+                    "before the first go cue, on no-go trials, after the last capture. Only used "
+                    "when --pos-ramp-per-step > 0")
+p.add_argument("--w-loss-vel", type=float, default=0.0,
+               help="weight on mean squared hand speed (m/s)^2. 0 = off (default)")
+# Phase the shaped loss in instead of using it from batch 0. With all of it on from the start,
+# two from-scratch runs (2026-10-06) fell straight into the x-only trap: nothing is ever
+# captured, so nearly the whole trial sits at the capped late weight, and "jump to the target's x
+# as soon as it appears" is a fast partial solution that then never improves (0 captures after
+# 7,000 batches, hand leaving 13-28 cm before the cue). The plain loss, by contrast, has got every
+# curriculum run to reach and hold. So: plain loss and no pulses until --shape-start-batch, then
+# a fraction a = (batch - start) / --shape-ramp-batches (clamped to [0, 1]) scales everything in:
+# dead-zone radius a * deadzone, position weight 1 + a * (w - 1), speed weight a * w_vel, pulse
+# force a * pulse_force_n. Defaults (0, 0) = fully on from the first batch.
+p.add_argument("--shape-start-batch", type=int, default=0,
+               help="batch at which the dead zone, time ramp, hold weight, speed penalty and "
+                    "force pulses begin to be phased in (0 = from the start)")
+p.add_argument("--shape-ramp-batches", type=int, default=0,
+               help="number of batches over which they are phased in linearly (0 = at once)")
 p.add_argument("--w-loss-path-length", type=float, default=0.0,
                help="weight on reach 0's excess path length (arc length beyond the straight-line "
                     "distance to its own target, over [delay_start, capture0]). 0 = off (default)")
@@ -99,7 +147,22 @@ p.add_argument("--perturb-mag", type=float, default=0.0,
                     "each hit trial samples uniform [0, mag]")
 p.add_argument("--perturb-dur-ms", type=float, default=100,
                help="duration (ms) of each perturbation pulse")
+# force pulses at the hand, several per trial, training batches only (horizon_sequence)
+p.add_argument("--pulse-prob", type=float, default=0.0,
+               help="probability per step that a hand-force pulse starts (steps already inside a "
+                    "pulse excluded); 0.004 = one every ~2.5 s at dt 10 ms. 0 = off (default)")
+p.add_argument("--pulse-force-n", type=float, default=0.0,
+               help="max pulse force (N); each pulse is uniform in [0, max], random direction")
+p.add_argument("--pulse-dur-ms", type=float, default=100,
+               help="duration (ms) of each hand-force pulse")
 p.add_argument("--snap-every", type=int, default=100)
+p.add_argument("--max-bad-batches", type=int, default=200,
+               help="stop the run after this many CONSECUTIVE batches whose loss or gradient was "
+                    "not finite (each such batch's update is skipped). A run that has gone NaN "
+                    "otherwise keeps occupying the GPU until its time limit. 0 = never stop")
+p.add_argument("--print-loss-every", type=int, default=0,
+               help="print every loss term's weighted contribution every N batches (0 = off); "
+                    "for smoke tests without wandb")
 p.add_argument("--ckpt-every", type=int, default=0,
                help="also save the controller every N batches to <run>/ckpts/, so behaviour can be "
                     "tracked over training rather than only at the end. 0 = off. Kept in a "
@@ -201,6 +264,12 @@ p.add_argument("--reach-len-range-cm", type=float, nargs=2, default=None, metava
                     "long, instead of drawing targets independently over the workspace (median "
                     "reach ~27 cm). Matches training to the 4.7 cm grid the models are tested on, "
                     "and makes target noise large relative to reach length.")
+p.add_argument("--reach-len-mix-frac", type=float, default=0.0,
+               help="fraction of each training batch made of LONG trials (targets over the whole "
+                    "workspace, successive ones at least --reach-len-long-min-cm apart); the rest "
+                    "use --reach-len-range-cm. 0 = off (default)")
+p.add_argument("--reach-len-long-min-cm", type=float, default=12.0,
+               help="minimum distance (cm) between successive targets on a long trial")
 p.add_argument("--target-noise-cm", type=float, default=0.0,
                help="std (cm) of fresh per-step Gaussian noise on the displayed coordinates of every "
                     "lit target slot (go cue and on-flags stay exact). Makes target location "
@@ -320,7 +389,11 @@ elif args.task == "horizon_sequence":
               force_advance=not args.no_force_advance,
               target_noise_cm=args.target_noise_cm,
               reach_len_range_cm=(tuple(args.reach_len_range_cm)
-                                  if args.reach_len_range_cm is not None else None))
+                                  if args.reach_len_range_cm is not None else None),
+              reach_len_mix_frac=args.reach_len_mix_frac,
+              reach_len_long_min_cm=args.reach_len_long_min_cm,
+              pulse_prob=args.pulse_prob, pulse_force_n=args.pulse_force_n,
+              pulse_dur_ms=args.pulse_dur_ms)
     _task_kwargs = dict(sk)
     task = make_task(args.task, eff, **sk)
 else:
@@ -373,7 +446,7 @@ num_eval = 30
 def make_eval_batch(tk):
     torch.manual_seed(123)
     saved = {}
-    for attr in ('perturb_prob', 'catch_prob', 'prob_catch'):
+    for attr in ('perturb_prob', 'pulse_prob', 'catch_prob', 'prob_catch'):
         if hasattr(tk, attr):
             saved[attr] = getattr(tk, attr); setattr(tk, attr, 0.0)
     batch = tk.make_batch(num_eval)
@@ -406,6 +479,7 @@ eval_inp = eval_batch[1]          # for a contingent task this is filled in duri
 
 # ----------------------------------------------------------------------------- train
 loss_hist, snapshots = [], []
+n_skipped, bad_streak = 0, 0                              # updates skipped for a non-finite loss/gradient
 best_err = float('inf')                                   # lowest eval endpoint error so far
 best_path = out(f"controller_{args.effector}_{args.arch}_best.pt")
 for i in tqdm(range(args.n_batch)):
@@ -419,6 +493,15 @@ for i in tqdm(range(args.n_batch)):
         # this reset a short-sequence checkpoint can keep the "best" slot for the rest of the run,
         # and anything evaluating _best.pt would silently test a stage-1 model.
         best_err = float('inf')
+    # how much of the shaped loss / training pulses is on at this batch (see --shape-start-batch)
+    if i < args.shape_start_batch:
+        shape_a = 0.0
+    elif args.shape_ramp_batches <= 0:
+        shape_a = 1.0
+    else:
+        shape_a = min(1.0, (i - args.shape_start_batch) / args.shape_ramp_batches)
+    if hasattr(task, 'pulse_force'):
+        task.pulse_force = shape_a * args.pulse_force_n
     states, desired, ts = rollout_batch(eff, controller, task.make_batch(args.batch_size),
                                         obs_noise=args.obs_noise, neural_noise=args.neural_noise,
                                         action_noise=args.action_noise)
@@ -430,12 +513,34 @@ for i in tqdm(range(args.n_batch)):
     # a task may supply a per-timestep mask marking steps that should not be scored -- e.g. the
     # window after an unpreviewed go cue, before the target can physically have been perceived.
     _err = (tracked - desired).abs().sum(-1)                               # (n, T)
+    with torch.no_grad():
+        err_raw = _err.mean()                                              # plain error, for logging
+    if args.pos_deadzone_cm > 0 and shape_a > 0:
+        # no cost inside the window. The test is the capture test (Euclidean distance to the
+        # reference), the cost outside stays the L1 error to its centre.
+        _dist2 = ((tracked - desired) ** 2).sum(-1)
+        _err = _err * (_dist2 >= (shape_a * args.pos_deadzone_cm / 100.0) ** 2).float()
+    if (args.pos_ramp_per_step > 0 and shape_a > 0 and isinstance(ts, dict)
+            and 'capture_times' in ts and 'move_start' in ts):
+        # weight by how long the current target has been the current target
+        _w = reach_time_weights(
+            ts, _err.shape[1], args.dt, grace_ms=args.pos_grace_ms,
+            ramp_start_ms=args.pos_ramp_start_ms, ramp_per_step=args.pos_ramp_per_step,
+            cap=args.pos_ramp_cap, hold_weight=args.pos_hold_weight).to(_err.device)
+        _err_w = _err * (1.0 + shape_a * (_w - 1.0))
+    else:
+        _err_w = _err
+    # `_err` (dead-zoned, unweighted) is what the blind-hold / urgency terms below re-score with
+    # their own windows; the time ramp belongs to the main position term only.
     _lm = ts.get('loss_mask') if isinstance(ts, dict) else None
     if _lm is None:
-        loss_pos = _err.mean()
+        loss_pos = _err_w.mean()
     else:
         _lm = _lm.to(_err.device).float()
-        loss_pos = (_err * _lm).sum() / _lm.sum().clamp(min=1.0)
+        loss_pos = (_err_w * _lm).sum() / _lm.sum().clamp(min=1.0)
+    # hand speed: with no position cost inside the window this is what makes the hand come to
+    # rest there, and it bounds peak speed against the time ramp
+    loss_vel = states.vel.pow(2).sum(-1).mean()
     # jerk loss is a *movement*-smoothness penalty, always on position (frozen -> 0 for the
     # isometric force task, whose force profile is meant to have sharp features and must NOT be
     # penalised by the position-tuned jerk weight).
@@ -532,23 +637,51 @@ for i in tqdm(range(args.n_batch)):
             + args.w_loss_hidden * loss_hidden + args.w_loss_hidden_diff * loss_hidden_diff
             + args.w_loss_blind_hold * loss_blind_hold
             + args.w_loss_urgency * loss_urgency
-            + args.w_loss_path_length * loss_path_length)
+            + args.w_loss_path_length * loss_path_length
+            + shape_a * args.w_loss_vel * loss_vel)
 
     opt.zero_grad()
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(controller.parameters(), max_norm=1.0)
-    opt.step()
+    grad_norm = torch.nn.utils.clip_grad_norm_(controller.parameters(), max_norm=1.0)   # norm BEFORE clipping
+    # Never apply a non-finite update. When the recurrent dynamics go unstable for a batch, the
+    # gradient through ~1000 steps can overflow; clip_grad_norm_ then scales by 1/inf and writes
+    # NaN into the gradients, one optimizer step makes every weight NaN, and the run is dead for
+    # good (cluster job 213032, batch 3,344). A blow-up whose gradient stays finite is recovered
+    # from within ~150 batches (run RB, batch 6,003), so skipping the bad update -- weights and
+    # Adam state untouched -- leaves the next batch a chance to pull the network back.
+    if torch.isfinite(grad_norm) and torch.isfinite(loss):
+        opt.step()
+        bad_streak = 0
+    else:
+        opt.zero_grad()
+        n_skipped += 1
+        bad_streak += 1
+        tqdm.write(f"[{i}] non-finite loss/gradient (loss {loss.item():.4g}, grad norm "
+                   f"{grad_norm.item():.4g}): update skipped ({n_skipped} skipped so far, "
+                   f"{bad_streak} in a row)")
+        if args.max_bad_batches and bad_streak >= args.max_bad_batches:
+            raise RuntimeError(f"stopping at batch {i}: {bad_streak} consecutive batches with a "
+                               f"non-finite loss or gradient -- the network has not recovered")
     loss_hist.append(loss.item())
 
-    if args.track:
+    if args.track or (args.print_loss_every and i % args.print_loss_every == 0):
         contrib = {'loss_tot': loss, 'pos': args.w_loss_pos * loss_pos, 'jerk': args.w_loss_jerk * loss_jerk,
             'muscle': args.w_loss_action * loss_action, 'muscle_diff': args.w_loss_action_diff * loss_action_diff, 'hidden':args.w_loss_hidden * loss_hidden,
             'hidden_diff':  args.w_loss_hidden_diff * loss_hidden_diff,
             'blind_hold': args.w_loss_blind_hold * loss_blind_hold,
             'urgency': args.w_loss_urgency * loss_urgency,
-            'path_length': args.w_loss_path_length * loss_path_length }
+            'path_length': args.w_loss_path_length * loss_path_length,
+            'vel': shape_a * args.w_loss_vel * loss_vel,
+            'pos_raw': err_raw,       # unweighted mean |error|, comparable across loss shapes
+            'shape_a': torch.tensor(shape_a),
+            'grad_norm': grad_norm,   # before clipping: how violent this batch's gradient was
+            'skipped_updates': torch.tensor(float(n_skipped)) }
 
-        wandb.log({f'{k}': v.item() for k, v in contrib.items()}, step=i)
+        if args.track:
+            wandb.log({f'{k}': v.item() for k, v in contrib.items()}, step=i)
+        if args.print_loss_every and i % args.print_loss_every == 0:
+            tqdm.write(f"[{i}] " + "  ".join(f"{k} {v.item():.4g}" for k, v in contrib.items()
+                                             if v.item() != 0.0))
 
     if args.ckpt_every and (i + 1) % args.ckpt_every == 0:
         os.makedirs(out("ckpts"), exist_ok=True)

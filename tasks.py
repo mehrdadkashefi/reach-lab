@@ -33,6 +33,8 @@ import math
 import numpy as np
 import torch
 
+from effectors import CartesianForce
+
 
 # Unified instruction width shared across every task (matches HorizonSequence's stream):
 # 3 target slots x [x, y, on] + go. Single-target tasks can opt into this wider layout via
@@ -140,6 +142,32 @@ def _random_perturbation(eff, n, T, device, prob, mag, dur_steps):
     tg = torch.arange(T, device=device).unsqueeze(0)                       # (1, T)
     win = ((tg >= onset.unsqueeze(1)) & (tg < (onset + d).unsqueeze(1))).float()   # (n, T)
     return win.unsqueeze(-1) * vec.unsqueeze(1)                            # (n, T, pdim)
+
+
+def _random_force_pulses(n, T, device, prob_per_step, max_force, dur_steps):
+    """Random training disturbance at the HAND: brief force pulses (N) of random direction and
+    magnitude uniform in [0, max_force], each lasting dur_steps. A pulse starts with probability
+    prob_per_step on every step that is not already inside one, so pulses never overlap and a
+    trial gets about T / (1/prob_per_step + dur_steps) of them, anywhere in the trial -- during
+    holds as much as during movement. Never shown to the controller: it has to feel the push
+    through its delayed feedback and hold or recover. Returns a CartesianForce ((n, T, 2)), which
+    the rollout turns into joint torque at the arm's posture of the moment, or None when off.
+
+    Built without a loop over time: the number of free steps before each pulse is geometric, so
+    the start times are a cumulative sum of geometric gaps plus the pulses already spent."""
+    if prob_per_step <= 0.0 or max_force <= 0.0:
+        return None
+    d = max(1, int(dur_steps))
+    K = int(3 * T * prob_per_step) + 10                       # far more pulses than can ever fit
+    u = torch.rand(n, K, device=device).clamp(min=1e-12)
+    gap = torch.floor(torch.log(u) / math.log1p(-prob_per_step)).long()     # free steps before pulse k
+    start = gap.cumsum(1) + d * torch.arange(K, device=device).unsqueeze(0)  # (n, K)
+    ang = 2 * math.pi * torch.rand(n, K, device=device)
+    mag = max_force * torch.rand(n, K, device=device)
+    vec = torch.stack([ang.cos(), ang.sin()], dim=-1) * mag.unsqueeze(-1)   # (n, K, 2)
+    tg = torch.arange(T, device=device).view(1, 1, T)
+    on = ((tg >= start.unsqueeze(-1)) & (tg < (start + d).unsqueeze(-1))).float()   # (n, K, T)
+    return CartesianForce(torch.einsum('nkt,nkc->ntc', on, vec))
 
 
 class DelayedReaching:
@@ -441,7 +469,9 @@ class HorizonSequence:
                  capture_mode='scripted', capture_radius_cm=1.0, capture_hold_ms=300,
                  reach_timeout_ms=800, reach_timeout_range_ms=None, force_advance=True,
                  target_noise_cm=0.0, reach_len_range_cm=None,
-                 perturb_prob=0.0, perturb_mag=0.0, perturb_dur_ms=100, **kwargs):
+                 reach_len_mix_frac=0.0, reach_len_long_min_cm=12.0,
+                 perturb_prob=0.0, perturb_mag=0.0, perturb_dur_ms=100,
+                 pulse_prob=0.0, pulse_force_n=0.0, pulse_dur_ms=100, **kwargs):
         self.effector = effector
         # How a target gets captured (and the next reach cued):
         #   'scripted'   : at a pre-sampled time (dwell_range_ms) regardless of where the hand
@@ -499,6 +529,18 @@ class HorizonSequence:
         self.reach_len_range = (None if reach_len_range_cm is None else
                                 (float(reach_len_range_cm[0]) / 100.0,
                                  float(reach_len_range_cm[1]) / 100.0))
+        # Mix of reach lengths within every batch. reach_len_mix_frac of the trials are LONG: their
+        # targets are spread over the whole workspace with successive ones at least
+        # reach_len_long_min_cm apart. The rest keep reach_len_range (the short, grid-like walk).
+        # The two regimes fail in opposite ways when trained alone -- short reaches alone make
+        # premature movement cheap (the first reach drifts off before its cue, holds are left
+        # early), long reaches alone give discipline and speed but no reason to wait for a noisy
+        # target -- so each batch carries both. Needs reach_len_range_cm for the short share.
+        self.reach_len_mix_frac = float(reach_len_mix_frac)
+        self.reach_len_long_min = float(reach_len_long_min_cm) / 100.0
+        assert 0.0 <= self.reach_len_mix_frac <= 1.0
+        assert self.reach_len_mix_frac == 0.0 or self.reach_len_range is not None, \
+            "reach_len_mix_frac needs reach_len_range_cm (the range of the short trials)"
         # How to handle the window after an *unpreviewed* go cue, during which the target has not
         # reached the controller yet (sensory delay):
         #   'delay' : the desired holds at the previous target across the window, so waiting is
@@ -536,6 +578,12 @@ class HorizonSequence:
         self.delay_lo, self.delay_hi = ms2steps(delay_range_ms[0]), ms2steps(delay_range_ms[1])
         self.dwell_lo, self.dwell_hi = ms2steps(dwell_range_ms[0]), ms2steps(dwell_range_ms[1])
         self.final_lo, self.final_hi = ms2steps(final_range_ms[0]), ms2steps(final_range_ms[1])
+        # force pulses at the hand, several per trial (see _random_force_pulses). Random batches
+        # only; an explicit spec carries its own perturbation or none. Takes over from
+        # perturb_prob/perturb_mag (one joint-torque pulse on a fraction of trials) when set.
+        self.pulse_prob = float(pulse_prob)
+        self.pulse_force = float(pulse_force_n)
+        self.pulse_dur = max(1, round(pulse_dur_ms / 1000 / effector.dt))
         if self.contingent:
             # Trial-level no-go IS supported: the stepper guards every capture check and every
             # go-cue write with ~nogo, so such a trial never goes live, never captures, and
@@ -562,13 +610,19 @@ class HorizonSequence:
         return self.capture_mode == 'contingent'
 
     def _sample_walk_targets(self, theta0, n, R, n_cand=768):
-        """(n, R, 2) targets forming a random walk whose every step length lies in
-        reach_len_range. Candidates are drawn exactly as independent targets are -- uniformly in
-        joint space, so each is reachable by construction -- and one whose distance from the
+        """(n, R, 2) targets forming a random walk whose every step length lies in that trial's
+        range: reach_len_range, or [reach_len_long_min, anywhere] for the reach_len_mix_frac of
+        trials that are long. Candidates are drawn exactly as independent targets are -- uniformly
+        in joint space, so each is reachable by construction -- and one whose distance from the
         previous point is in range is kept. If a trial has no candidate in range (rare: a point
         hemmed into a corner), it takes the one that misses the range by least."""
         eff, dev = self.effector, self.effector.device
-        lo, hi = self.reach_len_range
+        lo = torch.full((n, 1), self.reach_len_range[0], device=dev)
+        hi = torch.full((n, 1), self.reach_len_range[1], device=dev)
+        n_long = int(round(n * self.reach_len_mix_frac))                # exact share, like a split batch
+        if n_long > 0:
+            lo[:n_long] = self.reach_len_long_min
+            hi[:n_long] = float('inf')
         prev = eff.joint_to_cart(theta0)                                # (n, 2)
         rows = torch.arange(n, device=dev)
         out = []
@@ -664,8 +718,12 @@ class HorizonSequence:
             ridx    = torch.randint(1, max(2, R), (n,), device=dev)
             no_go_reach = torch.where(hit_r, ridx, torch.full_like(ridx, -1))         # (n,)
             pulse = self.go_pulse
-            perturbation = _random_perturbation(eff, n, T, dev,
-                                                self.perturb_prob, self.perturb_mag, self.perturb_dur)
+            if self.pulse_prob > 0.0 and self.pulse_force > 0.0:
+                perturbation = _random_force_pulses(n, T, dev, self.pulse_prob, self.pulse_force,
+                                                    self.pulse_dur)
+            else:
+                perturbation = _random_perturbation(eff, n, T, dev, self.perturb_prob,
+                                                    self.perturb_mag, self.perturb_dur)
         else:
             theta0, targets, n = self._resolve_spec_geometry(spec, dev)
             d1 = _as_col(spec.get("init_steps",  mid(self.init_lo,  self.init_hi)),  n, dev)
@@ -954,6 +1012,37 @@ class ContingentStepper:
                                                  self.horizon, self.nogo, no_go_reach, self.T)
         timestamps['timeouts'] = self.timeouts       # (n, R) reach was force-advanced, not captured
         return desired, timestamps
+
+
+def reach_time_weights(ts, T, dt, grace_ms=50.0, ramp_start_ms=100.0, ramp_per_step=0.1,
+                       cap=20.0, hold_weight=1.0):
+    """(n, T) weight on the position error as a function of how long the current target has been
+    the current target. From HorizonSequence timestamps `ts` (move_start (n,), capture_times
+    (n, R) with T = never captured, optional is_no_go (n,)).
+
+    Reach k is current from its advance (the go cue for k = 0, the capture of target k-1
+    otherwise) until target k is captured. With tau = steps since that advance:
+        tau <  grace       -> 0      nobody reacts instantly
+        tau <  ramp_start  -> 1
+        otherwise          -> 1 + ramp_per_step * (tau - ramp_start), at most `cap`
+    so being late costs more the later it gets, and the clock restarts at every capture. Where
+    the hand is simply meant to stay put -- before the first go cue, on a no-go trial, after the
+    last capture -- the weight is the constant `hold_weight`."""
+    dev = ts['capture_times'].device
+    ms = ts['move_start'].to(dev)                                       # (n,)
+    capt = ts['capture_times']                                          # (n, R)
+    adv = torch.cat([ms.unsqueeze(1), capt[:, :-1]], dim=1)             # (n, R) reach k begins
+    tt = torch.arange(T, device=dev).unsqueeze(0)                       # (1, T)
+    k = (tt.unsqueeze(-1) >= adv.unsqueeze(1)).sum(-1) - 1              # (n, T) current reach; -1 = none yet
+    tau = tt - adv.gather(1, k.clamp(min=0))                            # steps since it began
+    g = round(grace_ms / 1000.0 / dt)
+    r0 = round(ramp_start_ms / 1000.0 / dt)
+    w = (1.0 + ramp_per_step * (tau - r0).clamp(min=0).float()).clamp(max=cap)
+    w = torch.where(tau < g, torch.zeros_like(w), w)
+    hold = (k < 0) | (tt >= capt[:, -1:])                               # before go / after the last capture
+    if 'is_no_go' in ts:
+        hold = hold | ts['is_no_go'].to(dev).unsqueeze(1)
+    return torch.where(hold, torch.full_like(w, float(hold_weight)), w)
 
 
 def rollout_batch(effector, controller, batch, **rollout_kwargs):

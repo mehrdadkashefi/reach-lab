@@ -61,6 +61,18 @@ def ik_2link(xy, l1, l2, elbow_up=True, lim=None):
     return theta, reachable
 
 
+class CartesianForce:
+    """An external force at the fingertip, in Cartesian coordinates: `force` is (n, steps, 2) in N.
+
+    A task returns this in place of a native perturbation tensor when the disturbance is defined
+    at the hand rather than at the joints. Effector.rollout converts it to the plant's own
+    perturbation units every step at the arm's CURRENT posture (tau = J(theta_t)^T F), which a
+    tensor built ahead of the rollout cannot do: the arm has moved by the time the force lands,
+    and on a contingent task nobody knows where it will be."""
+    def __init__(self, force):
+        self.force = force
+
+
 class Effector:
     """Base class: holds shared params and the generic delayed-feedback rollout."""
     name = "base"
@@ -133,7 +145,9 @@ class Effector:
     # --- generic simulation with delayed visual + proprioceptive feedback ---
     def rollout(self, controller, theta0, inp, perturbation=None,
                 obs_noise=0.0, neural_noise=0.0, action_noise=0.0, task_step=None):
-        """perturbation: optional (batch, steps, perturbation_dim) external force/torque, or None.
+        """perturbation: optional (batch, steps, perturbation_dim) external force/torque in the
+                      plant's native units, a CartesianForce (fingertip force, converted at the
+                      current posture each step), or None.
 
         task_step:    optional closed-loop hook `task_step(s, pos)` called at the top of every
                       step with the hand's true position at the end of the previous step
@@ -194,7 +208,13 @@ class Effector:
             if neural_noise > 0.0:
                 h = h + neural_noise * torch.randn_like(h)
             h_hist[:, s, :] = h
-            pert_s = perturbation[:, s, :] if perturbation is not None else None
+            if perturbation is None:
+                pert_s = None
+            elif isinstance(perturbation, CartesianForce):
+                # hand force -> native units at the posture the arm is in right now
+                pert_s = self.cartesian_force_to_perturbation(st['theta'], perturbation.force[:, s, :])
+            else:
+                pert_s = perturbation[:, s, :]
             # action (motor/execution) noise: perturb the command that drives the plant, so the
             # network must correct for it via feedback (like obs/neural noise, but on the output)
             act = self.act_from_output(out)
