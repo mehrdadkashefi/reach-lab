@@ -85,9 +85,13 @@ class Effector:
     state_specs = {}
 
     def __init__(self, dt=0.01, vis_delay_ms=70, pro_delay_ms=25, task_dim=4,
-                 isometric=False, **kwargs):
+                 isometric=False, task_delay_ms=None, **kwargs):
         self.dt = dt
         self.vis_delay_ms = vis_delay_ms
+        # delay of the instruction stream (targets, go cue). None = the visual delay, as before.
+        # Set it longer to give displayed events a reaction latency without slowing the visual
+        # feedback of the hand.
+        self.task_delay_ms = vis_delay_ms if task_delay_ms is None else task_delay_ms
         self.pro_delay_ms = pro_delay_ms
         self.task_dim = int(task_dim)                 # width of the task/instruction stream
         # isometric mode: the plant is held fixed at its start posture (no movement) and each
@@ -99,6 +103,8 @@ class Effector:
     # --- derived ---
     @property
     def vis_d(self): return max(1, round(self.vis_delay_ms / 1000 / self.dt))
+    @property
+    def task_d(self): return max(1, round(self.task_delay_ms / 1000 / self.dt))
     @property
     def pro_d(self): return max(1, round(self.pro_delay_ms / 1000 / self.dt))
     @property
@@ -155,7 +161,7 @@ class Effector:
                       `inp[:, s, :]` in place -- e.g. a task whose target-capture depends on
                       where the hand actually is, so the instruction stream cannot be built
                       ahead of time. The controller still reads `inp` through the visual
-                      delay below, so row s is filled `vis_d` steps before it is ever seen.
+                      delay below, so row s is filled `task_d` steps before it is ever seen.
 
         obs_noise:    std of i.i.d. Gaussian noise added to the *observed* inputs each step:
                       the instruction / visual target (target xy + visibility & go cues), the
@@ -174,7 +180,7 @@ class Effector:
         All default to 0.0 (deterministic, identical to before)."""
         b, steps = theta0.shape[0], inp.shape[1]
         dev = theta0.device
-        vis_d, pro_d = self.vis_d, self.pro_d
+        vis_d, pro_d, task_d = self.vis_d, self.pro_d, self.task_d
 
         controller.start_sequence()
         st = self.reset(theta0)
@@ -187,11 +193,9 @@ class Effector:
         for s in range(steps):
             if task_step is not None:
                 task_step(s, hist['pos'][:, s - 1, :] if s > 0 else fb0['fingertip'])
-            # visual channel (70 ms): instruction + fingertip
-            if s >= vis_d:
-                inp_v = inp[:, s - vis_d, :]; ft_v = hist['pos'][:, s - vis_d, :]
-            else:
-                inp_v = inp[:, 0, :];         ft_v = fb0['fingertip']
+            # visual channel: instruction (task_d) + fingertip (vis_d); the same delay by default
+            inp_v = inp[:, s - task_d, :] if s >= task_d else inp[:, 0, :]
+            ft_v = hist['pos'][:, s - vis_d, :] if s >= vis_d else fb0['fingertip']
             # proprioceptive channel (25 ms)
             pro_p = pro_h[:, s - pro_d, :] if s >= pro_d else fb0['proprio']
 

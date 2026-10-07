@@ -159,6 +159,7 @@ def load_experiment(folder, device):
     eff = make_effector(cfg["effector"], dt=cfg.get("dt", 0.01),
                         vis_delay_ms=cfg.get("vis_delay_ms", 70),
                         pro_delay_ms=cfg.get("pro_delay_ms", 25),
+                        task_delay_ms=cfg.get("task_delay_ms"),
                         task_dim=task_input_channels(cfg["task"],
                                                      cfg.get("unified_input", False))).to(device)
     controller = build_controller(cfg, eff).to(device)
@@ -204,6 +205,7 @@ def _build_for_task(cfg, name, is_multi, device):
     eff = make_effector(cfg["effector"], dt=cfg.get("dt", 0.01),
                         vis_delay_ms=cfg.get("vis_delay_ms", 70),
                         pro_delay_ms=cfg.get("pro_delay_ms", 25),
+                        task_delay_ms=cfg.get("task_delay_ms"),
                         task_dim=task_input_channels(name, unified)).to(device)
     if is_multi:
         kw = {'unified_input': True}

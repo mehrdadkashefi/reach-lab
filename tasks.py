@@ -550,7 +550,7 @@ class HorizonSequence:
         #   'none'  : original behaviour, desired jumps at the capture
         assert blind_mode in ('delay', 'mask', 'none')
         self.blind_mode = blind_mode
-        self.blind_steps = (effector.vis_d if blind_ms is None
+        self.blind_steps = (effector.task_d if blind_ms is None
                             else max(0, round(blind_ms / 1000 / effector.dt)))
         if blind_mode == 'none':
             self.blind_steps = 0

@@ -36,6 +36,9 @@ p.add_argument("--arch", choices=["gru", "modular"], default="gru")
 p.add_argument("--dt", type=float, default=0.01)
 p.add_argument("--vis-delay-ms", type=float, default=70)
 p.add_argument("--pro-delay-ms", type=float, default=25)
+p.add_argument("--task-delay-ms", type=float, default=None,
+               help="delay of the instruction stream (targets, go cue); default = --vis-delay-ms. "
+                    "The visual feedback of the hand keeps --vis-delay-ms.")
 # learning parameters
 p.add_argument("--n-batch", type=int, default=600)
 p.add_argument("--batch-size", type=int, default=512)
@@ -322,6 +325,7 @@ print(f"saving results to {run_dir}")
 # ----------------------------------------------------------------------------- effector + task
 eff = make_effector(args.effector, dt=args.dt,
                     vis_delay_ms=args.vis_delay_ms, pro_delay_ms=args.pro_delay_ms,
+                    task_delay_ms=args.task_delay_ms,
                     task_dim=task_input_channels(args.task, args.unified_input)).to(device)
 
 perturb_kw = {'perturb_prob': args.perturb_prob, 'perturb_mag': args.perturb_mag,
@@ -400,7 +404,7 @@ else:
     raise ValueError(f"Invalid task: {args.task}")
 IS_FORCE_TASK = getattr(task, "is_force_task", False)               # isometric force task (pacman)
 print(f"effector: {eff.name}  (input_dim={eff.input_dim}, output_dim={eff.output_dim}, "
-      f"vis_d={eff.vis_d}, pro_d={eff.pro_d})")
+      f"vis_d={eff.vis_d}, pro_d={eff.pro_d}, task_d={eff.task_d})")
 print(f"task: {task.name}  (episode {task.steps} steps = {task.steps * args.dt:.2f} s)")
 
 # ----------------------------------------------------------------------------- controller
