@@ -18,7 +18,7 @@ cd $ROOT
 # train.py names the run folder by the second; two jobs that start together would share one.
 sleep $(( (SLURM_JOB_ID % 10) * 6 ))
 export WANDB_MODE=${2:-offline} WANDB_DIR=$ROOT WANDB_CACHE_DIR=/tmp/wandb-cache WANDB_CONFIG_DIR=/tmp/wandb-config
-export WANDB_ENTITY=amor-fati-org
+export WANDB_ENTITY=amor-fati
 export MPLCONFIGDIR=/tmp/mpl XDG_CACHE_HOME=/tmp/xdg-cache CUDA_CACHE_PATH=/tmp/nv-cache PYTHONUNBUFFERED=1
 echo "[train] job $SLURM_JOB_ID  node $(hostname)  partition $SLURM_JOB_PARTITION  task delay $DELAY ms  wandb $WANDB_MODE  $(date -u +%F_%T)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader

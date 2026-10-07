@@ -17,7 +17,7 @@ ROOT=/nfs/scratch/mkashefi/reach-lab
 export WANDB_CACHE_DIR=/tmp/wandb-cache WANDB_CONFIG_DIR=/tmp/wandb-config XDG_CACHE_HOME=/tmp/xdg-cache
 WANDB="$ROOT/env/bin/wandb"
 echo "[sync] job $SLURM_JOB_ID on $(hostname): $RUN  (watching training job ${TRAIN_JOB:-none})  $(date -u +%F_%T)"
-$WANDB beta sync --live --yes -e qa-ex-gen -p arm-rnn "$RUN" &
+$WANDB beta sync --live --yes -e amor-fati -p arm-rnn "$RUN" &
 SYNC=$!
 # The training job writes a progress line to its log every few seconds, so a log that has not
 # changed for 15 minutes means training is over (finished, cancelled or dead). This does not rely
@@ -35,5 +35,5 @@ while kill -0 $SYNC 2>/dev/null; do
 done
 wait $SYNC 2>/dev/null
 echo "[sync] live sync ended; final pass  $(date -u +%F_%T)"
-$WANDB beta sync --yes --no-skip-synced -e qa-ex-gen -p arm-rnn "$RUN"
+$WANDB beta sync --yes --no-skip-synced -e amor-fati -p arm-rnn "$RUN"
 echo "[sync] done  $(date -u +%F_%T)"
