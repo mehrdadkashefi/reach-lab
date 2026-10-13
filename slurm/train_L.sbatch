@@ -19,7 +19,7 @@ shift
 ROOT=/nfs/scratch/mkashefi/reach-lab
 cd $ROOT
 # train.py names the run folder by the second; two jobs that start together would share one.
-sleep $(( (SLURM_JOB_ID % 10) * 6 ))
+sleep $(( (SLURM_JOB_ID % 10) * 30 ))
 export WANDB_MODE=${WANDB_MODE:-offline} WANDB_DIR=$ROOT WANDB_CACHE_DIR=/tmp/wandb-cache WANDB_CONFIG_DIR=/tmp/wandb-config
 export WANDB_ENTITY=amor-fati
 export MPLCONFIGDIR=/tmp/mpl XDG_CACHE_HOME=/tmp/xdg-cache CUDA_CACHE_PATH=/tmp/nv-cache PYTHONUNBUFFERED=1

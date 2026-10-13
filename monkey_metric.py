@@ -1,6 +1,7 @@
 """monkey_metric.py -- score a contingent-capture test exactly as the monkey data are scored.
 
-usage: python monkey_metric.py TAG [TAG ...] [--fig out.png]   (reads experiments/_eval_TAG/test/sequence)
+usage: python monkey_metric.py TAG [TAG ...] [--fig out.png] [--spec-name seq3cm]
+       (reads experiments/_eval_TAG/test/<spec-name>, default "sequence")
 
 Inter-target interval (ITI), the monkey definition:
     reach 1      : go cue -> hand-in of target 1
@@ -24,8 +25,11 @@ import numpy as np
 np.seterr(all="ignore")
 
 
+SPEC = "sequence"          # test set to read (folder under test/); set by --spec-name
+
+
 def load(tag):
-    D = "experiments/_eval_%s/test/sequence/" % tag
+    D = "experiments/_eval_%s/test/%s/" % (tag, SPEC)
     d = dict(np.load(D + "states.npz", allow_pickle=True))
     tg = np.array(json.load(open(D + "spec_used.json"))["targets"])
     cfg = json.load(open("experiments/_eval_%s/config.json" % tag))
@@ -144,7 +148,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("tags", nargs="+")
     ap.add_argument("--fig", default=None)
+    ap.add_argument("--spec-name", default="sequence", help="test set folder under test/")
     a = ap.parse_args()
+    SPEC = a.spec_name
     axes = None
     if a.fig:
         import matplotlib

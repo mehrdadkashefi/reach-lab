@@ -163,6 +163,13 @@ p.add_argument("--max-bad-batches", type=int, default=200,
                help="stop the run after this many CONSECUTIVE batches whose loss or gradient was "
                     "not finite (each such batch's update is skipped). A run that has gone NaN "
                     "otherwise keeps occupying the GPU until its time limit. 0 = never stop")
+p.add_argument("--w-loss-wall", type=float, default=0.0,
+               help="dwell wall (contingent capture): from the moment the hand first enters the live "
+                    "target until that target is captured, distance beyond the capture window is "
+                    "charged at this weight on top of the position loss. Nothing is charged inside "
+                    "the window or after the capture. 0 = off. Scaled by the shape schedule.")
+p.add_argument("--wall-margin-cm", type=float, default=0.0,
+               help="start the wall this far inside the capture radius (0 = exactly at the window edge)")
 p.add_argument("--print-loss-every", type=int, default=0,
                help="print every loss term's weighted contribution every N batches (0 = off); "
                     "for smoke tests without wandb")
@@ -545,6 +552,15 @@ for i in tqdm(range(args.n_batch)):
     # hand speed: with no position cost inside the window this is what makes the hand come to
     # rest there, and it bounds peak speed against the time ramp
     loss_vel = states.vel.pow(2).sum(-1).mean()
+    # dwell wall: once the hand has entered the live target it owes a dwell; leaving the window
+    # before the capture is charged in proportion to how far out it goes (during those steps
+    # `desired` is that target). Free inside the window, and free from the capture on.
+    if args.w_loss_wall > 0 and isinstance(ts, dict) and 'wall' in ts:
+        _dist = (states.pos - desired).pow(2).sum(-1).add(1e-12).sqrt()
+        _edge = (args.capture_radius_cm - args.wall_margin_cm) / 100.0
+        loss_wall = ((_dist - _edge).clamp(min=0) * ts['wall'].to(device).float()).mean()
+    else:
+        loss_wall = torch.zeros((), device=device)
     # jerk loss is a *movement*-smoothness penalty, always on position (frozen -> 0 for the
     # isometric force task, whose force profile is meant to have sharp features and must NOT be
     # penalised by the position-tuned jerk weight).
@@ -642,7 +658,8 @@ for i in tqdm(range(args.n_batch)):
             + args.w_loss_blind_hold * loss_blind_hold
             + args.w_loss_urgency * loss_urgency
             + args.w_loss_path_length * loss_path_length
-            + shape_a * args.w_loss_vel * loss_vel)
+            + shape_a * args.w_loss_vel * loss_vel
+            + shape_a * args.w_loss_wall * loss_wall)
 
     opt.zero_grad()
     loss.backward()
@@ -676,6 +693,7 @@ for i in tqdm(range(args.n_batch)):
             'urgency': args.w_loss_urgency * loss_urgency,
             'path_length': args.w_loss_path_length * loss_path_length,
             'vel': shape_a * args.w_loss_vel * loss_vel,
+            'wall': shape_a * args.w_loss_wall * loss_wall,
             'pos_raw': err_raw,       # unweighted mean |error|, comparable across loss shapes
             'shape_a': torch.tensor(shape_a),
             'grad_norm': grad_norm,   # before clipping: how violent this batch's gradient was
