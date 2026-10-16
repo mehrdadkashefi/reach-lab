@@ -170,6 +170,16 @@ p.add_argument("--w-loss-wall", type=float, default=0.0,
                     "the window or after the capture. 0 = off. Scaled by the shape schedule.")
 p.add_argument("--wall-margin-cm", type=float, default=0.0,
                help="start the wall this far inside the capture radius (0 = exactly at the window edge)")
+p.add_argument("--w-loss-dwell-speed", type=float, default=0.0,
+               help="dwell speed (contingent capture): over the same steps as the wall (first entry "
+                    "into the live target until its capture), hand speed above --dwell-speed-cm-s is "
+                    "charged at this weight, so the dwell is a stop rather than a slow glide. "
+                    "0 = off. Scaled by the shape schedule.")
+p.add_argument("--dwell-speed-cm-s", type=float, default=2.5,
+               help="speed the dwell may reach without charge (monkey speed at capture ~1.5-2.5 cm/s)")
+p.add_argument("--dwell-speed-grace-ms", type=float, default=0.0,
+               help="the dwell-speed cost starts this long after the first entry, so the hand may "
+                    "still be braking as it comes in")
 p.add_argument("--print-loss-every", type=int, default=0,
                help="print every loss term's weighted contribution every N batches (0 = off); "
                     "for smoke tests without wandb")
@@ -561,6 +571,17 @@ for i in tqdm(range(args.n_batch)):
         loss_wall = ((_dist - _edge).clamp(min=0) * ts['wall'].to(device).float()).mean()
     else:
         loss_wall = torch.zeros((), device=device)
+    # dwell speed: over the wall's steps, speed above the free limit is charged (a stop, not a glide)
+    if args.w_loss_dwell_speed > 0 and isinstance(ts, dict) and 'wall' in ts:
+        _speed = states.vel.pow(2).sum(-1).add(1e-12).sqrt()
+        _w = ts['wall'].to(device).float()
+        # steps since the first entry: the wall is one unbroken run from entry to capture
+        _c = _w.cumsum(1)
+        _since = _c - (_c * (1 - _w)).cummax(1).values
+        _w = _w * (_since > args.dwell_speed_grace_ms / 1000.0 / args.dt).float()
+        loss_dwell_speed = ((_speed - args.dwell_speed_cm_s / 100.0).clamp(min=0) * _w).mean()
+    else:
+        loss_dwell_speed = torch.zeros((), device=device)
     # jerk loss is a *movement*-smoothness penalty, always on position (frozen -> 0 for the
     # isometric force task, whose force profile is meant to have sharp features and must NOT be
     # penalised by the position-tuned jerk weight).
@@ -659,7 +680,8 @@ for i in tqdm(range(args.n_batch)):
             + args.w_loss_urgency * loss_urgency
             + args.w_loss_path_length * loss_path_length
             + shape_a * args.w_loss_vel * loss_vel
-            + shape_a * args.w_loss_wall * loss_wall)
+            + shape_a * args.w_loss_wall * loss_wall
+            + shape_a * args.w_loss_dwell_speed * loss_dwell_speed)
 
     opt.zero_grad()
     loss.backward()
@@ -694,6 +716,7 @@ for i in tqdm(range(args.n_batch)):
             'path_length': args.w_loss_path_length * loss_path_length,
             'vel': shape_a * args.w_loss_vel * loss_vel,
             'wall': shape_a * args.w_loss_wall * loss_wall,
+            'dwell_speed': shape_a * args.w_loss_dwell_speed * loss_dwell_speed,
             'pos_raw': err_raw,       # unweighted mean |error|, comparable across loss shapes
             'shape_a': torch.tensor(shape_a),
             'grad_norm': grad_norm,   # before clipping: how violent this batch's gradient was
