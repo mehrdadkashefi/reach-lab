@@ -126,7 +126,7 @@ for c, h in enumerate((1, 2, 3)):
     for s in ("top", "right"):
         ax.spines[s].set_visible(False)
 ym = max(x_.get_ylim()[1] for x_ in axes[1]); [x_.set_ylim(0, ym) for x_ in axes[1]]
-fig.suptitle("%s: the median-duration completed trial of each horizon (circles = 1 cm capture windows; grey lines = captures)" % a.tag, fontsize=10, x=0.01, ha="left")
+fig.suptitle("%s: the median-duration completed trial of each horizon (circles = %.1f cm capture windows; grey lines = captures)" % (a.tag, radius * 100), fontsize=10, x=0.01, ha="left")
 fig.tight_layout()
 fig.savefig(out + "_examples.png", dpi=150)
 print("wrote", out + "_iti.png", out + "_examples.png")
