@@ -22,16 +22,58 @@ An external perturbation (created by the task) is an xy force for the point mass
 joint torque for the arms; it is added into the physics each step. None means no perturbation.
 """
 
+import importlib.util
 import math
+import os
+import sysconfig
+import types
 from types import SimpleNamespace
 import torch
 
+# torch.compile for rollouts: 'auto' compiles only when it pays off and works -- training (gradients
+# on) on a CUDA device, with Triton and a C compiler's Python headers available, and none of the
+# features the compiled step does not cover (a closed-loop task_step, CartesianForce perturbations,
+# isometric mode). True always compiles (and fails loudly), False never. Rollout's `compile`
+# argument overrides this module default; the training scripts set it from --compile.
+# Measured 2026-10-17 on an L40S (arm26, Hill muscle, NHP tasks): 1.1 s per training step compiled
+# vs 4.8 s, hand positions within 1e-4 cm and gradients within ~4e-6 of the uncompiled rollout.
+# A compiled rollout draws its noise differently, so it does not repeat an uncompiled one trial
+# for trial. The first call for each batch size / input pattern compiles (~1 min).
+COMPILE = 'auto'
+_COMPILE_BROKEN = False          # set when compiling failed once under 'auto'; then stay eager
+
+
+def compile_available():
+    """Can torch.compile's default backend build kernels here? Needs Triton and Python.h (which
+    Triton compiles a small C helper against). Python.h is looked for in the interpreter's include
+    directory and in C_INCLUDE_PATH / CPATH."""
+    if importlib.util.find_spec("triton") is None:
+        return False
+    dirs = [sysconfig.get_paths().get("include", "")]
+    for var in ("C_INCLUDE_PATH", "CPATH"):
+        dirs += [d for d in os.environ.get(var, "").split(os.pathsep) if d]
+    return any(os.path.exists(os.path.join(d, "Python.h")) for d in dirs)
+
 from physics import (point_mass_step, arm_step, arm_fingertip, arm_jacobian_T_force,
                      arm_endpoint_force, arm26_to, arm26_muscle_step, arm26_muscle_length,
-                     arm26_muscle_torque, muscle_activation_step)
+                     arm26_muscle_torque, muscle_activation_step, joint_viscosity_torque)
 
 # default arm range of motion (rad): shoulder 0-135 deg, elbow 0-155 deg
 DEFAULT_JOINT_LIMITS = ((0.0, math.radians(135)), (0.0, math.radians(155)))
+
+
+def _viscosity_matrix(viscosity):
+    """Passive joint damping as a (2, 2) tensor (N.m.s/rad), or None when zero. Accepts a scalar
+    (same on both joints, no coupling, as MotorNet's TwoDofArm), a pair (shoulder, elbow), or a
+    2x2 matrix."""
+    if viscosity is None:
+        return None
+    B = torch.as_tensor(viscosity, dtype=torch.float32)
+    if B.ndim == 0:
+        B = B * torch.eye(2)
+    elif B.ndim == 1:
+        B = torch.diag(B)
+    return None if bool((B == 0).all()) else B
 
 
 def ik_2link(xy, l1, l2, elbow_up=True, lim=None):
@@ -99,6 +141,7 @@ class Effector:
         # PacMan force task; leaves every moving task untouched.
         self.isometric = bool(isometric)
         self.device = torch.device("cpu")
+        self._compiled = {}              # compiled per-step functions, keyed by controller and noise
 
     # --- derived ---
     @property
@@ -149,8 +192,87 @@ class Effector:
     def collect(self, st, fb): raise NotImplementedError
 
     # --- generic simulation with delayed visual + proprioceptive feedback ---
+    def _use_compile(self, mode, perturbation, task_step):
+        """Whether this rollout runs the compiled step (see COMPILE at the top of the module)."""
+        mode = COMPILE if mode is None else mode
+        if mode is False or mode == 'off':
+            return False
+        unsupported = (task_step is not None or isinstance(perturbation, CartesianForce)
+                       or self.isometric)
+        if mode is True or mode == 'on':
+            if unsupported:
+                raise ValueError("compile=True: the compiled rollout does not support task_step, "
+                                 "CartesianForce perturbations or isometric mode")
+            return True
+        return (not _COMPILE_BROKEN and not unsupported and torch.is_grad_enabled()
+                and self.device.type == 'cuda' and compile_available())
+
+    def _compiled_step(self, controller, obs_noise, neural_noise, action_noise):
+        """One time step (controller, plant, feedback) as a compiled function, built once per
+        controller and noise setting."""
+        key = (id(controller), float(obs_noise), float(neural_noise), float(action_noise))
+        if key not in self._compiled:
+            import torch._dynamo
+            cfg = torch._dynamo.config               # one graph per batch size / input pattern
+            for name in ("recompile_limit", "cache_size_limit"):
+                if hasattr(cfg, name):
+                    setattr(cfg, name, max(getattr(cfg, name), 64))
+
+            def step(st, h, inp_v, ft_v, pro_p, pert_s):
+                if obs_noise > 0.0:
+                    inp_v = inp_v + obs_noise * torch.randn_like(inp_v)
+                    ft_v = ft_v + obs_noise * torch.randn_like(ft_v)
+                    pro_p = pro_p + obs_noise * torch.randn_like(pro_p)
+                out, h = controller(torch.cat([inp_v, ft_v, pro_p], dim=1), h)
+                if neural_noise > 0.0:
+                    h = h + neural_noise * torch.randn_like(h)
+                act = self.act_from_output(out)
+                if action_noise > 0.0:
+                    act = act + action_noise * torch.randn_like(act)
+                st = self.step(st, act, pert_s)
+                fb = self.feedback(st)
+                return st, h, fb['proprio'], self.collect(st, fb)
+            # torch.compile keeps one cache of compiled graphs per code object, shared by every
+            # closure made from it; give each (controller, noise) step its own code object so
+            # many tasks / controllers in one process do not fill that cache and silently fall
+            # back to uncompiled execution
+            code = step.__code__.replace(co_name=f"rollout_step_{len(self._compiled)}_{id(self)}")
+            step = types.FunctionType(code, step.__globals__, code.co_name, step.__defaults__,
+                                      step.__closure__)
+            self._compiled[key] = torch.compile(step, dynamic=False)
+        return self._compiled[key]
+
+    def _rollout_compiled(self, controller, theta0, inp, perturbation, obs_noise, neural_noise,
+                          action_noise):
+        """Same simulation as the loop in rollout, with the per-step work compiled. The histories
+        are collected in lists and stacked at the end instead of written in place."""
+        b, steps = theta0.shape[0], inp.shape[1]
+        dev = theta0.device
+        vis_d, pro_d, task_d = self.vis_d, self.pro_d, self.task_d
+        step = self._compiled_step(controller, obs_noise, neural_noise, action_noise)
+        controller.start_sequence()
+        st = self.reset(theta0)
+        h = torch.zeros(b, controller.hidden_dim, device=dev)
+        fb0 = self.feedback(st)
+        no_pert = torch.zeros(b, self.perturbation_dim, device=dev)
+        hist = {k: [] for k in self.state_specs}
+        pro_h, h_hist = [], []
+        for s in range(steps):
+            inp_v = inp[:, s - task_d, :] if s >= task_d else inp[:, 0, :]
+            ft_v = hist['pos'][s - vis_d] if s >= vis_d else fb0['fingertip']
+            pro_p = pro_h[s - pro_d] if s >= pro_d else fb0['proprio']
+            pert_s = no_pert if perturbation is None else perturbation[:, s, :]
+            st, h, pro, col = step(st, h, inp_v, ft_v, pro_p, pert_s)
+            h_hist.append(h)
+            pro_h.append(pro)
+            for k, v in col.items():
+                hist[k].append(v)
+        return SimpleNamespace(hidden=torch.stack(h_hist, 1),
+                               **{k: torch.stack(v, 1) for k, v in hist.items()})
+
     def rollout(self, controller, theta0, inp, perturbation=None,
-                obs_noise=0.0, neural_noise=0.0, action_noise=0.0, task_step=None):
+                obs_noise=0.0, neural_noise=0.0, action_noise=0.0, task_step=None,
+                compile=None):
         """perturbation: optional (batch, steps, perturbation_dim) external force/torque in the
                       plant's native units, a CartesianForce (fingertip force, converted at the
                       current posture each step), or None.
@@ -177,7 +299,22 @@ class Effector:
                       in [0,1] for arm26, which the activation dynamics then low-pass filter).
                       It perturbs what actually drives the physics, so the network must correct
                       for it through feedback -- like motor/execution noise.
-        All default to 0.0 (deterministic, identical to before)."""
+        All default to 0.0 (deterministic, identical to before).
+
+        compile:      None (module default COMPILE), 'auto', True or False -- run the per-step
+                      work through torch.compile (see COMPILE at the top of the module)."""
+        global _COMPILE_BROKEN
+        if self._use_compile(compile, perturbation, task_step):
+            mode = COMPILE if compile is None else compile
+            try:
+                return self._rollout_compiled(controller, theta0, inp, perturbation,
+                                              obs_noise, neural_noise, action_noise)
+            except Exception as err:                          # e.g. no C compiler / headers
+                if mode is True or mode == 'on':
+                    raise
+                _COMPILE_BROKEN = True
+                print(f"[effectors] torch.compile failed ({type(err).__name__}: {err}); "
+                      "running rollouts uncompiled from now on")
         b, steps = theta0.shape[0], inp.shape[1]
         dev = theta0.device
         vis_d, pro_d, task_d = self.vis_d, self.pro_d, self.task_d
@@ -303,8 +440,9 @@ class TwoJointArm(Effector):
 
     def __init__(self, dt=0.01, vis_delay_ms=70, pro_delay_ms=25,
                  sho_range=(0.35, 1.75), elb_range=(0.52, 2.18), torque_scale=10.0,
-                 joint_limits=DEFAULT_JOINT_LIMITS, **kwargs):
+                 joint_limits=DEFAULT_JOINT_LIMITS, joint_viscosity=0.0, **kwargs):
         super().__init__(dt, vis_delay_ms, pro_delay_ms, **kwargs)
+        self.joint_viscosity = _viscosity_matrix(joint_viscosity)     # passive joint damping
         self.sho_range = sho_range                    # sampling range (where targets are drawn)
         self.elb_range = elb_range
         self.torque_scale = torque_scale
@@ -313,6 +451,12 @@ class TwoJointArm(Effector):
         self.l1, self.l2 = 0.309, 0.333               # link lengths; must match arm_fingertip()
         self.action_names = ['shoulder torque', 'elbow torque']
         self.state_specs = {'pos': 2, 'vel': 2, 'joints': 2, 'action': 2, 'force': 2}
+
+    def to(self, device):
+        super().to(device)
+        if self.joint_viscosity is not None:
+            self.joint_viscosity = self.joint_viscosity.to(device)
+        return self
 
     def sample_joint(self, n):
         sho = torch.rand(n, 1, device=self.device) * (self.sho_range[1] - self.sho_range[0]) + self.sho_range[0]
@@ -359,6 +503,9 @@ class TwoJointArm(Effector):
             return {'theta': st['theta'], 'omega': torch.zeros_like(st['omega']),
                     'tau': tau, 'force': endforce}               # posture held fixed
         applied = tau if pert is None else tau + pert            # external perturbation torque
+        damp = joint_viscosity_torque(st['omega'], self.joint_viscosity)
+        if damp is not None:
+            applied = applied + damp
         theta, omega = arm_step(st['theta'], st['omega'], applied, self.dt, *self.lim)
         return {'theta': theta, 'omega': omega, 'tau': tau, 'force': endforce}
 
@@ -382,8 +529,15 @@ class Arm26(Effector):
 
     def __init__(self, dt=0.01, vis_delay_ms=70, pro_delay_ms=25,
                  sho_range=(0.35, 1.75), elb_range=(0.52, 2.18), muscle_names=None,
-                 joint_limits=DEFAULT_JOINT_LIMITS, **kwargs):
+                 joint_limits=DEFAULT_JOINT_LIMITS, muscle='hill', joint_viscosity=0.0,
+                 **kwargs):
         super().__init__(dt, vis_delay_ms, pro_delay_ms, **kwargs)
+        # muscle force law: 'hill' (MotorNet's RigidTendonHillMuscle: length- and velocity-
+        # dependent, gives the arm intrinsic damping and stiffness) or 'relu' (activation * Fmax,
+        # the original model; models trained before 2026-10-17 used it)
+        assert muscle in ('hill', 'relu'), muscle
+        self.muscle = muscle
+        self.joint_viscosity = _viscosity_matrix(joint_viscosity)     # passive joint damping
         self.sho_range = sho_range                    # sampling range (where targets are drawn)
         self.elb_range = elb_range
         (slo, shi), (elo, ehi) = joint_limits         # range of motion -> physics
@@ -399,6 +553,8 @@ class Arm26(Effector):
     def to(self, device):
         super().to(device)
         arm26_to(device)                              # move the muscle constants onto the device
+        if self.joint_viscosity is not None:
+            self.joint_viscosity = self.joint_viscosity.to(device)
         return self
 
     def sample_joint(self, n):
@@ -442,12 +598,15 @@ class Arm26(Effector):
 
     def step(self, st, excitation, pert=None):
         act = muscle_activation_step(st['act'], excitation, self.dt)   # activation dynamics still run
-        endforce = arm_endpoint_force(st['theta'], arm26_muscle_torque(st['theta'], act))
+        omega_now = torch.zeros_like(st['omega']) if self.isometric else st['omega']
+        endforce = arm_endpoint_force(st['theta'], arm26_muscle_torque(st['theta'], act, omega_now,
+                                                                       self.muscle))
         if self.isometric:
             return {'theta': st['theta'], 'omega': torch.zeros_like(st['omega']),
                     'act': act, 'force': endforce}                     # posture held fixed
         # external perturbation enters as a joint torque added to the muscle torque
-        theta, omega = arm26_muscle_step(st['theta'], st['omega'], act, self.dt, pert, *self.lim)
+        theta, omega = arm26_muscle_step(st['theta'], st['omega'], act, self.dt, pert, *self.lim,
+                                         muscle=self.muscle, viscosity=self.joint_viscosity)
         return {'theta': theta, 'omega': omega, 'act': act, 'force': endforce}
 
     def feedback(self, st):

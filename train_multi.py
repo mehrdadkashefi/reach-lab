@@ -65,6 +65,7 @@ def build_tasks(names, args, device):
     10-wide unified instruction stream so one controller fits them all.
     """
     eff_kw = dict(dt=args.dt, vis_delay_ms=args.vis_delay_ms, pro_delay_ms=args.pro_delay_ms,
+                  muscle=args.muscle, joint_viscosity=args.joint_viscosity,
                   task_dim=UNIFIED_INPUT_CHANNELS)
     eff_move = make_effector(args.effector, **eff_kw).to(device)
     eff_iso = None
@@ -200,6 +201,12 @@ def main():
                    help="per-training-task loss weights (comma-separated, order of --tasks); "
                         "default = equal weight for every task")
     p.add_argument("--effector", choices=["point_mass", "arm_torque", "arm26"], default="arm26")
+    p.add_argument("--muscle", choices=["hill", "relu"], default="hill",
+                   help="arm26 muscle force law: hill (MotorNet RigidTendonHillMuscle) or relu (activation x Fmax)")
+    p.add_argument("--joint-viscosity", type=float, default=0.0,
+                   help="passive joint damping (N.m.s/rad), same on both joints")
+    p.add_argument("--compile", choices=["auto", "on", "off"], default="auto",
+                   help="torch.compile the rollout: auto = on when training on CUDA and it works")
     p.add_argument("--arch", choices=["gru", "modular"], default="gru")
     p.add_argument("--hidden-dim", type=int, default=256)
     # training
@@ -237,6 +244,8 @@ def main():
     p.add_argument("--track", action="store_true", help="log to wandb")
     p.add_argument("--wandb-project", default="reach-lab-multitask")
     args = p.parse_args()
+    import effectors as _effectors
+    _effectors.COMPILE = args.compile
 
     for n in args.tasks:
         if n not in TASKS:

@@ -157,6 +157,8 @@ def load_experiment(folder, device):
         cfg = json.load(f)
 
     eff = make_effector(cfg["effector"], dt=cfg.get("dt", 0.01),
+                        muscle=cfg.get("muscle", "relu"),            # runs before 2026-10-17: relu
+                        joint_viscosity=cfg.get("joint_viscosity", 0.0),
                         vis_delay_ms=cfg.get("vis_delay_ms", 70),
                         pro_delay_ms=cfg.get("pro_delay_ms", 25),
                         task_delay_ms=cfg.get("task_delay_ms"),
@@ -203,6 +205,8 @@ def _build_for_task(cfg, name, is_multi, device):
     task gets its own effector (it holds the plant fixed); everything else uses a normal one."""
     unified = True if is_multi else cfg.get("unified_input", False)
     eff = make_effector(cfg["effector"], dt=cfg.get("dt", 0.01),
+                        muscle=cfg.get("muscle", "relu"),            # runs before 2026-10-17: relu
+                        joint_viscosity=cfg.get("joint_viscosity", 0.0),
                         vis_delay_ms=cfg.get("vis_delay_ms", 70),
                         pro_delay_ms=cfg.get("pro_delay_ms", 25),
                         task_delay_ms=cfg.get("task_delay_ms"),

@@ -1688,9 +1688,9 @@ class PacManTask:
 #                  hand they are 0.6-2.4 N (pulse) and 0.4-1.6 N (ramp), depending on direction.
 #                  The default test torques (0.4 and 0.27 N.m) give this arm the same range of
 #                  hand forces (0.9-2.4 N and 0.6-1.6 N).
-# All three share one instruction stream ([x, y, on, go], or the 10-wide unified layout) and
-# carry NO task cue: slot 0 shows the home location until a task event changes it, so the tasks
-# are indistinguishable to the controller until the reach target appears or a load is felt.
+# All three share one instruction stream (the 10-wide unified layout: 3 slots x [x, y, on] + go)
+# and carry NO task cue: slot 0 shows the home location, so the tasks are indistinguishable to the
+# controller until the reach target appears (in slot 1) or a load is felt.
 NHP_HOME_DEG = (32.0, 72.0)                         # shoulder, elbow (relative) at home
 NHP_REACH_DIRS = (0, 45, 90, 135, 180, 225, 270, 315)
 NHP_REACH_CM = 5.0
@@ -1754,10 +1754,17 @@ class NHPCenterOut(_NHPBase):
     """Delayed center-out reach from the home posture.
 
         1. home hold : slot 0 shows the home location, go = 0.       duration ~ init_range_ms
-        2. delay     : slot 0 switches to the reach target, go = 0; keep holding at home.
-                                                                     duration ~ delay_range_ms
-        3. reach     : go pulse (go_pulse_ms); reach to the target and hold there to the end of
-                       the episode (at least post_ms after the go cue). The target stays shown.
+        2. delay     : the reach target appears in slot 1 while slot 0 keeps showing home;
+                       go = 0; keep holding at home.                 duration ~ delay_range_ms
+        3. reach     : go cue = home (slot 0) turns off, with a go pulse (go_pulse_ms); reach to
+                       the target, which stays in slot 1, and hold there to the end of the
+                       episode (at least post_ms after the go cue).
+
+    This is the display the monkeys saw (home lit until the go cue) and needs the unified
+    10-wide stream. target_slot=0 is the earlier layout, kept for models trained with it: the
+    target replaces home in slot 0 when it appears and nothing but the go pulse marks the cue.
+    With that layout "keep the hand on slot 0" (the whole of the pulse and ramp tasks) moves the
+    hand at target onset, and every model crept part-way to the target before the cue.
 
     Random batches draw the reach direction uniformly and its length from reach_range_cm; a
     prob_no_go fraction of trials never get the go cue and must hold at home (the monkeys had no
@@ -1769,8 +1776,11 @@ class NHPCenterOut(_NHPBase):
 
     def __init__(self, effector, init_range_ms=(300, 700), delay_range_ms=(300, 800),
                  post_ms=1500, reach_range_cm=(2.0, 8.0), prob_no_go=0.3, go_pulse_ms=150,
-                 desired_profile='step', mj_move_ms=400, **kwargs):
+                 desired_profile='step', mj_move_ms=400, target_slot=1, **kwargs):
         super().__init__(effector, **kwargs)
+        assert target_slot in (0, 1)
+        assert target_slot == 0 or self.unified_input, "target_slot=1 needs unified_input=True"
+        self.target_slot = target_slot
         self.init_lo, self.init_hi = self._ms(init_range_ms[0]), self._ms(init_range_ms[1])
         self.delay_lo, self.delay_hi = self._ms(delay_range_ms[0]), self._ms(delay_range_ms[1])
         self.post = self._ms(post_ms)
@@ -1834,10 +1844,20 @@ class NHPCenterOut(_NHPBase):
         after_go = (tg >= t2) & ~nogo
         go = after_go if pulse is None else (after_go & (tg < t2 + pulse))
 
-        inp = torch.zeros(n, T, 4, device=dev)
-        inp[:, :, 0:2] = torch.where(shown, target.unsqueeze(1), home.unsqueeze(1))
-        inp[:, :, 2] = 1.0
-        inp[:, :, 3] = go.float()
+        if self.target_slot == 0:
+            inp = torch.zeros(n, T, 4, device=dev)
+            inp[:, :, 0:2] = torch.where(shown, target.unsqueeze(1), home.unsqueeze(1))
+            inp[:, :, 2] = 1.0
+            inp[:, :, 3] = go.float()
+            inp = self._pack(inp)
+        else:
+            home_on = (~after_go).float().unsqueeze(-1)                   # home lit until the go cue
+            inp = torch.zeros(n, T, UNIFIED_INPUT_CHANNELS, device=dev)
+            inp[:, :, 0:2] = home.unsqueeze(1) * home_on
+            inp[:, :, 2:3] = home_on
+            inp[:, :, 3:5] = target.unsqueeze(1) * shown.float()
+            inp[:, :, 5:6] = shown.float()
+            inp[:, :, -1] = go.float()
 
         if self.desired_profile == 'step':
             desired = torch.where(after_go.unsqueeze(-1), target.unsqueeze(1), home.unsqueeze(1))
@@ -1850,10 +1870,11 @@ class NHPCenterOut(_NHPBase):
             'move_start':  t2.squeeze(-1).long(),                          # go cue
             'episode_end': torch.full((n,), T, dtype=torch.long, device=dev),
             'is_no_go':    nogo.squeeze(-1),
+            'hold_mask':   ~after_go,          # (n, T) steps the hand should be still at home
             'angle_deg':   ang * 180.0 / math.pi,
             'reach_cm':    dist * 100.0,
         }
-        return theta0, self._pack(inp), desired, None, timestamps
+        return theta0, inp, desired, None, timestamps
 
 
 class _NHPLoad(_NHPBase):
@@ -1961,6 +1982,7 @@ class _NHPLoad(_NHPBase):
             'torque_nm':   amp,
             'torque_angle_deg': ang * 180.0 / math.pi,
             'is_catch':    amp == 0,
+            'hold_mask':   tg < start,         # (n, T) steps before the load: still at home
         }
         return theta0, self._pack(inp), desired, perturbation, timestamps
 

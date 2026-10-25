@@ -24,6 +24,12 @@ def list_of_int(s):   return [int(x) for x in s.split(',')]
 p = argparse.ArgumentParser()
 # --- main / training ---
 p.add_argument("--effector", choices=["point_mass", "arm_torque", "arm26"], default="arm26")
+p.add_argument("--muscle", choices=["hill", "relu"], default="hill",
+               help="arm26 muscle force law: hill (MotorNet RigidTendonHillMuscle) or relu (activation x Fmax)")
+p.add_argument("--joint-viscosity", type=float, default=0.0,
+               help="passive joint damping (N.m.s/rad), same on both joints")
+p.add_argument("--compile", choices=["auto", "on", "off"], default="auto",
+               help="torch.compile the rollout: auto = on when training on CUDA and it works")
 p.add_argument("--task", choices=["delayed_reach", "delayed_reach_posture", "horizon_sequence",
                                   "hold_posture_pulse", "hold_posture_ramp", "pursuit",
                                   "pacman"],
@@ -324,6 +330,8 @@ p.add_argument("--spectral-scaling", type=float, default=None)
 p.add_argument("--connectivity", type=list_of_float, default=None,
                help="flattened 3x3 (row = receiver); overrides the module default")
 args = p.parse_args()
+import effectors as _effectors
+_effectors.COMPILE = args.compile
 
 device = torch.device("mps" if torch.backends.mps.is_available()
                       else "cuda" if torch.cuda.is_available() else "cpu")
@@ -341,6 +349,7 @@ print(f"saving results to {run_dir}")
 
 # ----------------------------------------------------------------------------- effector + task
 eff = make_effector(args.effector, dt=args.dt,
+                    muscle=args.muscle, joint_viscosity=args.joint_viscosity,
                     vis_delay_ms=args.vis_delay_ms, pro_delay_ms=args.pro_delay_ms,
                     task_delay_ms=args.task_delay_ms,
                     task_dim=task_input_channels(args.task, args.unified_input)).to(device)

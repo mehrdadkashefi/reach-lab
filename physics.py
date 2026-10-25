@@ -1,10 +1,27 @@
+import functools
 import math
 import torch
+
+
+class _Scripted:
+    """A physics function in two forms: TorchScript (used normally) and the plain Python original
+    (used while torch.compile is tracing, since it cannot look inside TorchScript functions and
+    would fall back to running them one operation at a time)."""
+
+    def __init__(self, fn):
+        self.py = fn
+        self.script = torch.jit.script(fn)
+        functools.update_wrapper(self, fn)
+
+    def __call__(self, *args, **kwargs):
+        if torch.compiler.is_compiling():
+            return self.py(*args, **kwargs)
+        return self.script(*args, **kwargs)
 
 # ----------------------------------------------------------------------------------------
 # POINT MASS  (force applied directly in xy, exactly like your update_physics)
 # ----------------------------------------------------------------------------------------
-@torch.jit.script
+@_Scripted
 def point_mass_step(pos, vel, force, dt: float = 0.01, mass: float = 1.0):
     """pos, vel, force: (batch, 2). Returns (pos, vel)."""
     vel = vel + (force / mass) * dt
@@ -18,7 +35,7 @@ def point_mass_step(pos, vel, force, dt: float = 0.01, mass: float = 1.0):
 #   m1=1.82, m2=1.43 (kg) | l1=0.309, l2=0.333 (m) | l1g=0.135, l2g=0.165 (m)
 #   i1=0.051, i2=0.057 (kg.m^2) | joint limits: shoulder [0,135deg], elbow [0,155deg]
 # ----------------------------------------------------------------------------------------
-@torch.jit.script
+@_Scripted
 def arm_step(theta, omega, tau, dt: float = 0.01,
              sho_lo: float = 0.0, sho_hi: float = 2.356194490192345,
              elb_lo: float = 0.0, elb_hi: float = 2.705260340591211):
@@ -75,7 +92,7 @@ def arm_step(theta, omega, tau, dt: float = 0.01,
     return theta, omega
 
 
-@torch.jit.script
+@_Scripted
 def arm_jacobian_T_force(theta, force_xy):
     """Map a Cartesian fingertip force to joint torque: tau = J(theta)^T @ F.
     theta, force_xy: (batch, 2).  Returns joint torque (batch, 2) = [shoulder, elbow].
@@ -95,7 +112,7 @@ def arm_jacobian_T_force(theta, force_xy):
     return torch.stack([tau_s, tau_e], dim=1)
 
 
-@torch.jit.script
+@_Scripted
 def arm_endpoint_force(theta, tau):
     """Inverse of arm_jacobian_T_force: the Cartesian fingertip force F that a joint torque tau
     produces at posture theta, F = (J^T)^{-1} tau.  theta, tau: (batch, 2) -> force (batch, 2).
@@ -117,7 +134,7 @@ def arm_endpoint_force(theta, tau):
     return torch.stack([fx, fy], dim=1)
 
 
-@torch.jit.script
+@_Scripted
 def arm_fingertip(theta, omega):
     """Forward kinematics: joint state -> fingertip (x, y, vx, vy).  theta, omega: (batch, 2)."""
     l1 = 0.309; l2 = 0.333
@@ -135,8 +152,14 @@ def arm_fingertip(theta, omega):
 
 # ----------------------------------------------------------------------------------------
 # OPTIONAL: drive the arm with 6 muscles instead of raw joint torques
-# (Kistemaker et al. 2010 moment-arm geometry; ReLU muscle force = activation * Fmax)
+# (Kistemaker et al. 2010 moment-arm geometry, as MotorNet's RigidTendonArm26)
 # order: pectoralis, deltoid, brachioradialis, triceps-lat, biceps, triceps-long
+# Two force laws (muscle='hill' or 'relu'):
+#   hill : MotorNet's RigidTendonHillMuscle. Force depends on activation, muscle length and
+#          muscle velocity, plus a passive elastic force, so an active muscle resists being
+#          moved (damping) and co-contraction stiffens the joint.
+#   relu : force = activation * Fmax. No length or velocity dependence: the arm has no damping
+#          or stiffness of its own beyond what the controller produces.
 # These are eager (not scripted), so module-level constant tensors are fine here.
 # ----------------------------------------------------------------------------------------
 _FMAX = torch.tensor([838., 1207., 1422., 1549., 414., 603.])           # (6,)
@@ -146,13 +169,67 @@ _A1 = torch.tensor([[-.03, .03, 0., 0., -.03, .03],
 _A2 = torch.tensor([[0., 0., 0., 0., 0., 0.],
                     [0., 0., -4e-3, -2.2e-3, -5.7e-3, -3.2e-3]])        # (2,6)
 _A3 = torch.tensor([math.pi / 2, 0.])                                   # (2,)  angle offsets
+# RigidTendonHillMuscle constants (MotorNet RigidTendonArm26 defaults)
+_L0_SE = torch.tensor([0.039, 0.066, 0.172, 0.187, 0.204, 0.217])     # tendon slack length (m)
+_L0_CE = torch.tensor([0.134, 0.140, 0.092, 0.093, 0.137, 0.127])     # optimal fibre length (m)
+_HILL_NS = 1.4                                    # normalised slack length of the passive element
+_HILL_KPE = 1.0 / (1.66 - _HILL_NS) ** 2          # passive stiffness
+_HILL_MIN_ACT = 0.001                             # MotorNet's minimum activation for this muscle
 
 
 def arm26_to(device):
     """Move the muscle constants to `device` once before training."""
-    global _FMAX, _A0, _A1, _A2, _A3
+    global _FMAX, _A0, _A1, _A2, _A3, _L0_SE, _L0_CE
     _FMAX = _FMAX.to(device); _A0 = _A0.to(device); _A1 = _A1.to(device)
     _A2 = _A2.to(device); _A3 = _A3.to(device)
+    _L0_SE = _L0_SE.to(device); _L0_CE = _L0_CE.to(device)
+
+
+@_Scripted
+def _hill_force(activation, length, velocity, l0_se, l0_ce, fmax, ns: float, kpe: float,
+                min_act: float):
+    """RigidTendonHillMuscle force in N (MotorNet), all in one scripted function so it runs as
+    few GPU kernels as possible. activation, length, velocity: (batch, 6) activation and
+    musculotendon length / velocity (rigid tendon: the fibre moves with the musculotendon)."""
+    a = torch.clamp(activation, min=min_act)
+    fibre = torch.clamp(length - l0_se, min=0.0)
+    l_n = fibre / l0_ce                                 # fibre length / optimal
+    v_n = velocity / (10.0 * l0_ce)                     # fibre velocity / vmax (negative = shortening)
+    strain = torch.clamp(l_n - ns, min=0.0)
+    flpe = kpe * strain * strain                        # passive elastic force
+    flce = torch.clamp(1.0 - (l_n - 1.0) * (l_n - 1.0) / 0.4356, min=0.01)
+    a_rel = torch.where(l_n > 1.0, 0.41 * flce, torch.full_like(l_n, 0.41))
+    c = 1.0 - 0.9 * (a - 0.3) / (0.005 - 0.3)
+    b_rel = torch.where(a < 0.3, 5.2 * c * c, torch.full_like(a, 5.2))
+    d0 = a * (flce + a_rel) / b_rel
+    fxa = flce * a
+    s_as = 0.001
+    # Guard (not in MotorNet): s_as - 2 d0 passes through zero when activation x force-length is
+    # tiny (activation near its minimum on a muscle stretched far past optimal), sending the
+    # eccentric force's gradient to ~1e7 and then inf / NaN. Keeping d0 >= s_as changes the force
+    # only where the active force is below ~0.1% of Fmax.
+    den = torch.clamp(s_as - 2.0 * d0, max=-s_as)
+    p1 = -0.5 * fxa / den
+    p2 = 0.25 * fxa * fxa / den
+    p3 = -1.5 * fxa
+    # both branches are evaluated for every element, so each is fed only velocities of its own sign
+    # (a NaN or inf in the unused branch would still reach the gradient through torch.where)
+    v_c = torch.clamp(v_n, max=0.0)
+    concentric = (v_c * a * a_rel + fxa * b_rel) / (b_rel - v_c)
+    v_e = torch.clamp(v_n, min=0.0)
+    eccentric = (-p1 * p3 + p1 * s_as * v_e + p2 - p3 * v_e + s_as * v_e * v_e) / (p1 + v_e)
+    active = torch.clamp(torch.where(v_n < 0.0, concentric, eccentric), min=0.0)
+    return (active + flpe) * fmax
+
+
+def arm26_muscle_force(activation, length, velocity, muscle: str = "hill"):
+    """Muscle force (batch, 6) in N. length / velocity: musculotendon length and velocity
+    (batch, 1, 6) or (batch, 6); with a rigid tendon the fibre moves with the musculotendon."""
+    if muscle == "relu":
+        return activation * _FMAX.view(1, 6)
+    return _hill_force(activation, length.reshape(activation.shape),
+                       velocity.reshape(activation.shape), _L0_SE.view(1, 6), _L0_CE.view(1, 6),
+                       _FMAX.view(1, 6), _HILL_NS, _HILL_KPE, _HILL_MIN_ACT)
 
 
 def arm26_moment_arms(theta, omega):
@@ -166,7 +243,7 @@ def arm26_moment_arms(theta, omega):
     return moment_arm, length, velocity
 
 
-@torch.jit.script
+@_Scripted
 def muscle_activation_step(activation, excitation, dt: float = 0.01,
                            tau_act: float = 0.015, tau_deact: float = 0.05):
     """First-order Thelen-style activation dynamics (MotorNet defaults).
@@ -188,29 +265,44 @@ def arm26_muscle_length(theta):
     return ((a1 + q * a2) * q).sum(1) + _A0.view(1, 6)
 
 
-def arm26_muscle_torque(theta, activation):
-    """Joint torque (batch,2) produced by the 6 muscles at posture theta given activation (batch,6).
-    Same ReLU-muscle torque as arm26_muscle_step, but without advancing the arm (for isometric
-    force readout). Velocity is irrelevant to the torque here, so moment arms use omega=0."""
-    moment_arm, _, _ = arm26_moment_arms(theta, torch.zeros_like(theta))   # (batch,2,6)
-    force = activation.unsqueeze(1) * _FMAX.view(1, 1, 6)                   # (batch,1,6)
+def arm26_muscle_torque(theta, activation, omega=None, muscle: str = "relu"):
+    """Joint torque (batch,2) produced by the 6 muscles at posture theta given activation (batch,6),
+    the same torque as arm26_muscle_step but without advancing the arm (for the endpoint-force
+    readout). omega: joint velocity (only the Hill muscle depends on it; default at rest)."""
+    if omega is None:
+        omega = torch.zeros_like(theta)
+    moment_arm, length, velocity = arm26_moment_arms(theta, omega)         # (batch,2,6)
+    force = arm26_muscle_force(activation, length, velocity, muscle).unsqueeze(1)
     return -(force * moment_arm).sum(-1)                                    # (batch,2)
+
+
+def joint_viscosity_torque(omega, viscosity):
+    """Passive joint damping torque -B @ omega (batch, 2); viscosity B is a (2, 2) tensor in
+    N.m.s/rad, or None for none."""
+    if viscosity is None:
+        return None
+    return -omega @ viscosity.T
 
 
 def arm26_muscle_step(theta, omega, activation, dt: float = 0.01, ext_tau=None,
                       sho_lo: float = 0.0, sho_hi: float = 2.356194490192345,
-                      elb_lo: float = 0.0, elb_hi: float = 2.705260340591211):
+                      elb_lo: float = 0.0, elb_hi: float = 2.705260340591211,
+                      muscle: str = "relu", viscosity=None):
     """Advance the arm one step given the current muscle activations.
     activation: (batch, 6) in [0,1] -- the muscle state AFTER activation dynamics.
     ext_tau:    optional (batch, 2) external joint torque added to the muscle torque
                 (e.g. an experimental perturbation).
     sho_*/elb_*: joint range of motion (rad), forwarded to arm_step.
-    ReLU muscle:  force = activation * Fmax.  For a Hill muscle, replace the `force`
-    line with a length/velocity-dependent force using `length` / `velocity` below.
+    muscle:     'relu' (force = activation * Fmax) or 'hill' (RigidTendonHillMuscle).
+    viscosity:  optional (2, 2) passive joint damping matrix (N.m.s/rad).
+    Muscle force is computed from the state at the start of the step, as in MotorNet.
     """
     moment_arm, length, velocity = arm26_moment_arms(theta, omega)
-    force = activation.unsqueeze(1) * _FMAX.view(1, 1, 6)         # (batch,1,6)
+    force = arm26_muscle_force(activation, length, velocity, muscle).unsqueeze(1)  # (batch,1,6)
     tau = -(force * moment_arm).sum(-1)                           # (batch,2) joint torques
     if ext_tau is not None:
         tau = tau + ext_tau                                      # add external perturbation torque
+    damp = joint_viscosity_torque(omega, viscosity)
+    if damp is not None:
+        tau = tau + damp
     return arm_step(theta, omega, tau, dt, sho_lo, sho_hi, elb_lo, elb_hi)
