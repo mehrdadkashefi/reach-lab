@@ -972,6 +972,11 @@ class ContingentStepper:
         self.last_pulse = self.t_go.view(-1).clone()                    # go time of the live reach
         self.bounds = torch.full((n, R), self.T, dtype=torch.long, device=dev)  # T = never captured
         self.timeouts = torch.zeros(n, R, dtype=torch.bool, device=dev)
+        # dwell bookkeeping for the wall loss: `entered` = the hand has been inside the live
+        # target's window since that target became live; `wall[:, s]` = that was true at step s
+        # and the target was still uncaptured, i.e. the hand owes a dwell and must not leave
+        self.entered = torch.zeros(n, dtype=torch.bool, device=dev)
+        self.wall = torch.zeros(n, self.T, dtype=torch.bool, device=dev)
 
     @torch.no_grad()
     def step(self, s, pos):
@@ -984,6 +989,7 @@ class ContingentStepper:
         tgt = self.targets[rows, self.cur.clamp(max=R - 1)]             # (n, 2)
         inside = ((pos.detach() - tgt) ** 2).sum(-1) < task.capture_radius ** 2
         self.in_tol = torch.where(inside & live, self.in_tol + 1, torch.zeros_like(self.in_tol))
+        self.entered = self.entered | (inside & live)
         held = self.in_tol >= task.capture_hold_steps
         timed_out = (s - self.last_pulse) >= self.deadline[rows, self.cur.clamp(max=R - 1)]
         captured = live & (held | (timed_out & self.task.force_advance))
@@ -995,9 +1001,11 @@ class ContingentStepper:
             self.last_pulse = torch.where(captured, torch.full_like(self.last_pulse, s),
                                           self.last_pulse)
             self.in_tol = torch.where(captured, torch.zeros_like(self.in_tol), self.in_tol)
+            self.entered = self.entered & ~captured
 
         # -- instruction row for step s (after any capture, like the scripted `cur`) -------
         live = (s >= t_go) & (self.cur < R) & ~self.nogo
+        self.wall[:, s] = self.entered & live
         cur_eff = torch.where(self.nogo, torch.zeros_like(self.cur), self.cur)
         go = live if self.pulse is None else live & ((s - self.last_pulse) < self.pulse)
         self.inp[:, s, :] = task._instruction(cur_eff.unsqueeze(1), (s >= t_delay).unsqueeze(1),
@@ -1011,6 +1019,7 @@ class ContingentStepper:
                                                  self.t_go, self.bounds, pulse_times,
                                                  self.horizon, self.nogo, no_go_reach, self.T)
         timestamps['timeouts'] = self.timeouts       # (n, R) reach was force-advanced, not captured
+        timestamps['wall'] = self.wall               # (n, T) hand has entered the live target and owes a dwell
         return desired, timestamps
 
 
